@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""rcctl: build, load and talk to the house's recirculation-pump controller (Waveshare ESP32-S3-Relay-1CH).
+
+  rcctl build              compile recirc_esp32 (writes secrets.h and version.h first)
+  rcctl flash [PORT]       first load over USB-C
+  rcctl publish            build, then put it on bedichek.org; the controller pulls it within the hour
+                           ("rcctl cmd update check" to make it look now)
+  rcctl update             build, then push it over the LAN (when this machine can reach the controller)
+  rcctl status             the controller's state (JSON)
+  rcctl log [BYTES]        recent output
+  rcctl cmd WORDS...       a console command, e.g. "rcctl cmd phone add aa:bb:cc:dd:ee:ff rob"
+  rcctl wifi               set the Wi-Fi network name and password compiled into the firmware
+
+The controller is http://recirc (set RCCTL_HOST to override).  Its secrets live in ~/.config/recirc/, made on
+first use and compiled into the firmware; never print them:
+  wifi          network name and password (asked for, never echoed)
+  lan_token     commands and LAN updates
+  ingest_token  its telemetry uploads to bedichek.org (also listed in the ingest service's tokens file)
+  fw_token      reading its firmware from bedichek.org (also in the nginx location that serves it)
+"""
+
+import getpass
+import glob
+import hashlib
+import json
+import os
+import secrets
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+import uuid
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+SKETCH = os.path.join(HERE, "recirc_esp32")
+BUILD = os.path.join(HERE, "build")
+BIN = os.path.join(BUILD, "recirc_esp32.ino.bin")
+# ESP32-S3R8: 8 MB octal PSRAM in the package.  4 MB with two OTA slots fits whatever flash the board carries;
+# check what esptool reports on the first USB flash before choosing a bigger layout.
+FQBN = "esp32:esp32:esp32s3:FlashSize=4M,PartitionScheme=min_spiffs,PSRAM=opi,CDCOnBoot=cdc"
+HOST = os.environ.get("RCCTL_HOST", "recirc")
+CONF = os.path.expanduser("~/.config/recirc")
+SERVER = "bedichek"                       # ssh name of the bedichek.org server
+FW_DIR = "/var/lib/recirc-fw"             # served (with fw_token) as https://bedichek.org/home/api/fw/recirc/
+
+
+def private_write(path, text):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+
+
+def token(name):
+    path = os.path.join(CONF, name)
+    if not os.path.exists(path):
+        private_write(path, secrets.token_hex(24) + "\n")
+    with open(path) as f:
+        return f.read().strip()
+
+
+def wifi(ask=False):
+    path = os.path.join(CONF, "wifi")
+    if ask or not os.path.exists(path):
+        ssid = input("House Wi-Fi network name: ").strip()
+        pw = getpass.getpass("Wi-Fi password (not shown): ")
+        private_write(path, json.dumps({"ssid": ssid, "password": pw}) + "\n")
+    with open(path) as f:
+        w = json.load(f)
+    return w["ssid"], w["password"]
+
+
+def c_string(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def write_if_changed(path, text, private=False):
+    old = open(path).read() if os.path.exists(path) else None
+    if old != text:
+        if private:
+            private_write(path, text)
+        else:
+            with open(path, "w") as f:
+                f.write(text)
+
+
+def write_headers():
+    ssid, pw = wifi()
+    write_if_changed(os.path.join(SKETCH, "secrets.h"),
+                     "// Written by rcctl from ~/.config/recirc; not in git\n"
+                     f"#define RC_WIFI_SSID {c_string(ssid)}\n"
+                     f"#define RC_WIFI_PASS {c_string(pw)}\n"
+                     f'#define RC_LAN_TOKEN "{token("lan_token")}"\n'
+                     f'#define RC_INGEST_TOKEN "{token("ingest_token")}"\n'
+                     f'#define RC_FW_TOKEN "{token("fw_token")}"\n', private=True)
+    rev = subprocess.run(["git", "-C", HERE, "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
+    dirty = subprocess.run(["git", "-C", HERE, "status", "--porcelain", "--", "recirc_esp32"],
+                           capture_output=True, text=True).stdout.strip()
+    build_id = time.strftime("%Y%m%d-%H%M%S") + "-" + (rev or "nogit") + ("+" if dirty else "")
+    write_if_changed(os.path.join(SKETCH, "version.h"),
+                     f'// Written by rcctl on every build; not in git\n#define RC_BUILD_ID "{build_id}"\n')
+    return build_id
+
+
+def build():
+    build_id = write_headers()
+    r = subprocess.run(["arduino-cli", "compile", "--fqbn", FQBN, "--output-dir", BUILD,
+                        "--warnings", "default", SKETCH])
+    if r.returncode != 0:
+        sys.exit(r.returncode)
+    return build_id
+
+
+def request(path, data=None, timeout=10, headers=None):
+    req = urllib.request.Request(f"http://{HOST}{path}", data=data, headers=headers or {})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode()
+
+
+def cmd(text):
+    return request("/cmd", text.encode(), headers={"X-Token": token("lan_token")})
+
+
+def push_update():
+    build()
+    boundary = uuid.uuid4().hex
+    body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"firmware\"; filename=\"recirc.bin\"\r\n"
+            "Content-Type: application/octet-stream\r\n\r\n").encode() + open(BIN, "rb").read() + \
+        f"\r\n--{boundary}--\r\n".encode()
+    print(request("/update", body, timeout=120, headers={"X-Token": token("lan_token"),
+                                                          "Content-Type": f"multipart/form-data; boundary={boundary}"}))
+
+
+def publish():
+    build_id = build()
+    data = open(BIN, "rb").read()
+    manifest = json.dumps({"build": build_id, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}) + "\n"
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "recirc.json"), "w") as f:
+            f.write(manifest)
+        # The binary first, then the manifest that points at it, each renamed into place
+        for name, src in (("recirc.bin", BIN), ("recirc.json", os.path.join(d, "recirc.json"))):
+            subprocess.run(["scp", "-q", src, f"{SERVER}:{FW_DIR}/.{name}.new"], check=True)
+            subprocess.run(["ssh", SERVER, f"chmod 0640 {FW_DIR}/.{name}.new && mv {FW_DIR}/.{name}.new {FW_DIR}/{name}"],
+                           check=True)
+    print(f"published {build_id} ({len(data)} bytes)")
+
+
+def flash(port=None):
+    build()
+    if port is None:
+        ports = sorted(glob.glob("/dev/cu.usbmodem*"))
+        if len(ports) != 1:
+            sys.exit(f"give the port; found {ports or 'none'}")
+        port = ports[0]
+    r = subprocess.run(["arduino-cli", "upload", "--fqbn", FQBN, "--input-dir", BUILD, "-p", port, SKETCH])
+    sys.exit(r.returncode)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    c = args[0]
+    if c == "build":
+        print(build())
+    elif c == "flash":
+        flash(args[1] if len(args) > 1 else None)
+    elif c == "publish":
+        publish()
+    elif c == "update":
+        push_update()
+    elif c == "status":
+        print(request("/status"), end="")
+    elif c == "log":
+        print(request("/log" + (f"?bytes={int(args[1])}" if len(args) > 1 else "")), end="")
+    elif c == "cmd":
+        print(cmd(" ".join(args[1:])), end="")
+    elif c == "wifi":
+        wifi(ask=True)
+        print("saved; it takes effect at the next build")
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()

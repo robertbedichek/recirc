@@ -1,5 +1,69 @@
 # recirc
 
-Controller for the hot-water recirculation pump at the house, on a Waveshare ESP32-S3 board.
+Controller for the hot-water recirculation pump at the house: a Waveshare
+[ESP32-S3-Relay-1CH](https://www.waveshare.com/wiki/ESP32-S3-Relay-1CH) on Wi-Fi, switching a Grundfos
+120 VAC pump (about 30 W).
 
-Work in progress.
+## What it does
+
+- Every 20 minutes, on the clock (:00, :20, :40), it runs the pump until the return line has warmed 4 °F above
+  where it started, or for 80 seconds, whichever comes first.
+- It runs only when someone is home, and never from 11 PM to 7 AM.
+- The run-now button runs it at any time.
+- It never runs without a working return-line temperature.
+- **Someone is home** when one of these happened within the last 60 minutes:
+  - A family phone was seen on the house Wi-Fi. Every 2 minutes it sweeps the local /24 for their MAC
+    addresses using ARP, the network's address lookup.
+  - A Hue light was switched or dimmed. It polls the bridge's local API every minute.
+  
+  With neither configured it assumes someone is home. `mode home` and `mode away` override this.
+- **Time** comes from NTP and is kept across outages by the onboard PCF85063 clock chip, which holds UTC.
+  The schedule uses Pacific time.
+- **Telemetry** is posted to `https://bedichek.org/home/api/ingest/recirc`, appending to
+  `/var/www/html/home/recirc.txt`. Lines containing "alert" go to Pushover, as for the solar controllers.
+  - `YYYY-MM-DD HH:MM:SS run schedule warm secs 34 start 61.2 end 65.4 peak 65.6`
+  - `YYYY-MM-DD HH:MM:SS status T 64.2 home 1 phone 12 hue 45 lights 3/41 runs 14 secs 410 rssi -62`,
+    every 5 minutes. `phone` and `hue` are minutes since last seen, -1 meaning never.
+- **Firmware updates are pulled**, because the house LAN isn't reachable from Palo Alto.
+  - Every hour it reads `recirc.json` from `https://bedichek.org/home/api/fw/recirc/` and, if the build
+    differs, downloads `recirc.bin`, checks its SHA-256 and installs it.
+  - A new image that can't reach bedichek.org within 2 minutes rolls back to the previous one.
+  - `rcctl update` pushes over the LAN when you're at the house.
+
+## Wiring
+
+| Board | Goes to |
+|---|---|
+| Relay COM / NO | Pump hot (line) wire, in and out. Neutral and ground go straight to the pump. |
+| VCC / GND screws | 5 V DC (Mean Well HDR-15-5 on the DIN rail, or USB-C) |
+| 4-pin header, black (GND) | DS18B20 GND; run-now button |
+| red (3V3) | DS18B20 VDD; 4.7 k pull-up |
+| yellow (IO1) | DS18B20 data; other end of the 4.7 k |
+| orange (IO2) | run-now button (to GND; internal pull-up) |
+
+Clamp the DS18B20 to the return line near the water heater, with insulation over it. Onboard: relay on IO47,
+the PCF85063 clock chip on I2C SDA 39, SCL 38 (address 0x51), RS485 on 17/18/21 (unused).
+
+## Bring-up
+
+1. `./rcctl wifi`: enter the house Wi-Fi name and password. They're stored in `~/.config/recirc/wifi`, not in git.
+2. Plug the board into this Mac by USB-C, then run `./rcctl flash`. Note the flash size esptool reports;
+   the build assumes 4 MB with two update slots.
+3. On the server:
+   - Add `recirc <ingest_token>` to the ingest service's tokens file.
+   - Make `/var/lib/recirc-fw`.
+   - Add an nginx location `/home/api/fw/recirc/` that serves it only with `Authorization: Bearer <fw_token>`.
+     The firmware has the Wi-Fi password compiled in, so it must never be public.
+4. `./rcctl cmd upload on`. Then register the phones:
+   - Set each family iPhone's cabin Wi-Fi to **Private Wi-Fi Address: Fixed**.
+   - Read each phone's address from Settings → Wi-Fi → (network) → Wi-Fi Address.
+   - `./rcctl cmd phone add aa:bb:cc:dd:ee:ff rob`
+5. Pair Hue: press the bridge's round link button, then within 30 s run `./rcctl cmd hue pair <bridge ip>`.
+6. After that: `./rcctl publish`, and the board takes the new build within the hour.
+   `./rcctl cmd update check` makes it look now.
+
+## Commands
+
+`run`, `stop`, `mode auto|home|away`, `set interval|maxrun|rise|hold|quiet <v>`, `phone add|del`, `phones`,
+`hue pair <ip>|forget`, `upload on|off`, `update check`, `reboot`. Send them over USB serial, or with
+`./rcctl cmd ...` on the LAN.
