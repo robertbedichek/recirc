@@ -49,11 +49,14 @@ the PCF85063 clock chip on I2C SDA 39, SCL 38 (address 0x51), RS485 on 17/18/21 
 1. `./rcctl wifi`: enter the house Wi-Fi name and password. They're stored in `~/.config/recirc/wifi`, not in git.
 2. Plug the board into this Mac by USB-C, then run `./rcctl flash`. Note the flash size esptool reports;
    the build assumes 4 MB with two update slots.
-3. On the server:
-   - Add `recirc <ingest_token>` to the ingest service's tokens file.
-   - Make `/var/lib/recirc-fw`.
-   - Add an nginx location `/home/api/fw/recirc/` that serves it only with `Authorization: Bearer <fw_token>`.
-     The firmware has the Wi-Fi password compiled in, so it must never be public.
+3. Server side, done 2026-11-10:
+   - `recirc` is in `/etc/home-ingest/tokens`, with home-ingest restarted.
+   - `/var/lib/recirc-fw` is mode 2750 `claude:www-data`. rcctl publish scp's into it as `claude`.
+   - `/etc/nginx/snippets/recirc-fw.conf`, included after `home-ingest.conf`, serves it at
+     `/home/api/fw/recirc/` only with `Authorization: Bearer <fw_token>`. The firmware has the Wi-Fi
+     password compiled in, so it must never be public.
+   - Tested: the right token gets 200, no token or a wrong one gets 403, and the other `/home/api/` paths
+     still reach the ingest service.
 4. `./rcctl cmd upload on`. Then register the phones:
    - Set each family iPhone's cabin Wi-Fi to **Private Wi-Fi Address: Fixed**.
    - Read each phone's address from Settings → Wi-Fi → (network) → Wi-Fi Address.
