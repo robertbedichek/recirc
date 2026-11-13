@@ -9,11 +9,11 @@
   rcctl status             the controller's state (JSON)
   rcctl log [BYTES]        recent output
   rcctl cmd WORDS...       a console command, e.g. "rcctl cmd phone add aa:bb:cc:dd:ee:ff rob"
-  rcctl wifi               set the Wi-Fi network name and password compiled into the firmware
+  rcctl wifi               set the Wi-Fi networks compiled into the firmware (cabin, plus an optional second)
 
 The controller is http://recirc (set RCCTL_HOST to override).  Its secrets live in ~/.config/recirc/, made on
 first use and compiled into the firmware; never print them:
-  wifi          network name and password (asked for, never echoed)
+  wifi          up to two network names and passwords (asked for, never echoed)
   lan_token     commands and LAN updates
   ingest_token  its telemetry uploads to bedichek.org (also listed in the ingest service's tokens file)
   fw_token      reading its firmware from bedichek.org (also in the nginx location that serves it)
@@ -36,9 +36,10 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 SKETCH = os.path.join(HERE, "recirc_esp32")
 BUILD = os.path.join(HERE, "build")
 BIN = os.path.join(BUILD, "recirc_esp32.ino.bin")
-# ESP32-S3R8: 8 MB octal PSRAM in the package.  4 MB with two OTA slots fits whatever flash the board carries;
-# check what esptool reports on the first USB flash before choosing a bigger layout.
-FQBN = "esp32:esp32:esp32s3:FlashSize=4M,PartitionScheme=min_spiffs,PSRAM=opi,CDCOnBoot=cdc"
+# ESP32-S3R8: 8 MB octal PSRAM in the package; esptool read 16 MB quad flash on 2026-11-13.  Two 3 MB OTA
+# slots (the rest is an unused FAT partition; settings live in NVS).  The partition table can't change over
+# OTA, so keep this layout for every build.
+FQBN = "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,CDCOnBoot=cdc"
 HOST = os.environ.get("RCCTL_HOST", "recirc")
 CONF = os.path.expanduser("~/.config/recirc")
 SERVER = "bedichek"                       # ssh name of the bedichek.org server
@@ -61,14 +62,21 @@ def token(name):
 
 
 def wifi(ask=False):
+    """[(ssid, password), ...]: the cabin network first, then an optional second one (e.g. for bench testing
+    at home).  The board joins whichever it can see."""
     path = os.path.join(CONF, "wifi")
     if ask or not os.path.exists(path):
+        nets = []
         ssid = input("House Wi-Fi network name: ").strip()
-        pw = getpass.getpass("Wi-Fi password (not shown): ")
-        private_write(path, json.dumps({"ssid": ssid, "password": pw}) + "\n")
+        nets.append({"ssid": ssid, "password": getpass.getpass(f"Password for {ssid} (not shown): ")})
+        ssid = input("Second network name, e.g. for testing at home (Enter for none): ").strip()
+        if ssid:
+            nets.append({"ssid": ssid, "password": getpass.getpass(f"Password for {ssid} (not shown): ")})
+        private_write(path, json.dumps({"networks": nets}) + "\n")
     with open(path) as f:
         w = json.load(f)
-    return w["ssid"], w["password"]
+    nets = w.get("networks") or [{"ssid": w["ssid"], "password": w["password"]}]
+    return [(n["ssid"], n["password"]) for n in nets[:2]]
 
 
 def c_string(s):
@@ -86,11 +94,12 @@ def write_if_changed(path, text, private=False):
 
 
 def write_headers():
-    ssid, pw = wifi()
+    nets = wifi()
+    wifi_defs = "".join(f"#define RC_WIFI{'' if i == 0 else i + 1}_SSID {c_string(ssid)}\n"
+                        f"#define RC_WIFI{'' if i == 0 else i + 1}_PASS {c_string(pw)}\n"
+                        for i, (ssid, pw) in enumerate(nets))
     write_if_changed(os.path.join(SKETCH, "secrets.h"),
-                     "// Written by rcctl from ~/.config/recirc; not in git\n"
-                     f"#define RC_WIFI_SSID {c_string(ssid)}\n"
-                     f"#define RC_WIFI_PASS {c_string(pw)}\n"
+                     "// Written by rcctl from ~/.config/recirc; not in git\n" + wifi_defs +
                      f'#define RC_LAN_TOKEN "{token("lan_token")}"\n'
                      f'#define RC_INGEST_TOKEN "{token("ingest_token")}"\n'
                      f'#define RC_FW_TOKEN "{token("fw_token")}"\n', private=True)

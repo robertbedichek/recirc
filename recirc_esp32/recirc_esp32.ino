@@ -54,7 +54,7 @@
 #include "lwip/netif.h"
 #include "lwip/tcpip.h"
 
-#include "secrets.h"   // RC_WIFI_SSID, RC_WIFI_PASS, RC_LAN_TOKEN, RC_INGEST_TOKEN, RC_FW_TOKEN: written by rcctl, not in git
+#include "secrets.h"   // RC_WIFI_SSID, RC_WIFI_PASS (optional RC_WIFI2_SSID, RC_WIFI2_PASS), RC_LAN_TOKEN, RC_INGEST_TOKEN, RC_FW_TOKEN: written by rcctl, not in git
 #include "version.h"   // RC_BUILD_ID: written by rcctl on every build, not in git
 
 #define HOSTNAME        "recirc"
@@ -886,6 +886,48 @@ void handle_update_done(void)
   ESP.restart();
 }
 
+// Up to two networks are compiled in (rcctl wifi): normally the cabin's, plus a second for bench testing
+// elsewhere.  The board joins whichever one it can see, preferring the first, and looks again when Wi-Fi has
+// been down for 3 minutes.
+struct WifiNet { const char *ssid, *pass; };
+const WifiNet WIFI_NETS[] = {
+  {RC_WIFI_SSID, RC_WIFI_PASS},
+#ifdef RC_WIFI2_SSID
+  {RC_WIFI2_SSID, RC_WIFI2_PASS},
+#endif
+};
+const int WIFI_NET_COUNT = sizeof(WIFI_NETS) / sizeof(WIFI_NETS[0]);
+
+void wifi_join(void)
+{
+  const WifiNet *pick = &WIFI_NETS[0];
+  if (WIFI_NET_COUNT > 1) {
+    esp_task_wdt_reset();
+    int n = WiFi.scanNetworks();           // blocking, about 2 s
+    esp_task_wdt_reset();
+    bool found = false;
+    for (int k = 0; k < WIFI_NET_COUNT && !found; k++)
+      for (int i = 0; i < n; i++)
+        if (WiFi.SSID(i) == WIFI_NETS[k].ssid) { pick = &WIFI_NETS[k]; found = true; break; }
+    WiFi.scanDelete();
+  }
+  Serial.printf("# joining Wi-Fi %s\n", pick->ssid);
+  WiFi.begin(pick->ssid, pick->pass);
+}
+
+void watch_wifi(void)
+{
+  static unsigned long down_since;
+  if (WiFi.status() == WL_CONNECTED) { down_since = 0; return; }
+  unsigned long now = millis();
+  if (down_since == 0) { down_since = now; return; }
+  if (WIFI_NET_COUNT > 1 && now - down_since > 180000UL) {
+    down_since = now;
+    WiFi.disconnect();
+    wifi_join();
+  }
+}
+
 void setup_network(void)
 {
   WiFi.mode(WIFI_STA);
@@ -896,7 +938,7 @@ void setup_network(void)
     if (e == ARDUINO_EVENT_WIFI_STA_GOT_IP) log_event("Wi-Fi up, " + WiFi.localIP().toString() + ", rssi " + String(WiFi.RSSI()));
     if (e == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) Serial.printf("# Wi-Fi lost (reason %d)\n", info.wifi_sta_disconnected.reason);
   });
-  WiFi.begin(RC_WIFI_SSID, RC_WIFI_PASS);
+  wifi_join();
   const char *headers[] = {"X-Token"};
   server.collectHeaders(headers, 1);
   server.on("/", HTTP_GET, handle_status);
@@ -1119,6 +1161,7 @@ void loop(void)
       if (last_rtc_write == 0 || now - last_rtc_write > 3600000UL) { if (rtc_write(time(nullptr))) last_rtc_write = now; }
     }
     schedule();
+    watch_wifi();
     if (!good_checked && (net_proven || now > GOOD_AFTER_MS)) { good_checked = true; mark_firmware_good(); }
   }
   if (now - last_status >= 300000 || last_status == 0) {

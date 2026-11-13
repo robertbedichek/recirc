@@ -3,3 +3,4 @@ build/
 .DS_Store
 recirc_esp32/secrets.h
 recirc_esp32/version.h
+__pycache__/

@@ -46,9 +46,11 @@ the PCF85063 clock chip on I2C SDA 39, SCL 38 (address 0x51), RS485 on 17/18/21 
 
 ## Bring-up
 
-1. `./rcctl wifi`: enter the house Wi-Fi name and password. They're stored in `~/.config/recirc/wifi`, not in git.
-2. Plug the board into this Mac by USB-C, then run `./rcctl flash`. Note the flash size esptool reports;
-   the build assumes 4 MB with two update slots.
+1. `./rcctl wifi`: enter the cabin Wi-Fi name and password, and optionally a second network (e.g. remyfi, for
+   testing in Palo Alto). They're stored in `~/.config/recirc/wifi`, not in git. The board joins whichever of
+   the two it can see, preferring the cabin's, and looks again after 3 minutes without Wi-Fi.
+2. Plug the board into this Mac by USB-C, then run `./rcctl flash`. The board has 16 MB of flash (esptool,
+   2026-11-13); the build uses two 3 MB update slots. Over-the-air updates can't change that layout.
 3. Server side, done 2026-11-10:
    - `recirc` is in `/etc/home-ingest/tokens`, with home-ingest restarted.
    - `/var/lib/recirc-fw` is mode 2750 `claude:www-data`. rcctl publish scp's into it as `claude`.
