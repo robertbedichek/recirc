@@ -862,6 +862,9 @@ bool update_authorized = false;
 void handle_update_upload(void)
 {
   HTTPUpload &upload = server.upload();
+  // The whole upload is received inside server.handleClient(), so loop() can't feed the 8 s watchdog meanwhile;
+  // over a slow link that reset the board mid-upload (2026-11-13).  Feed it per chunk.
+  esp_task_wdt_reset();
   if (upload.status == UPLOAD_FILE_START) {
     update_authorized = server.header("X-Token") == RC_LAN_TOKEN;
     if (update_authorized) { stop_run("update"); Update.begin(UPDATE_SIZE_UNKNOWN); }

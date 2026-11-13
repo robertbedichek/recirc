@@ -5,7 +5,7 @@
   rcctl flash [PORT]       first load over USB-C
   rcctl publish            build, then put it on bedichek.org; the controller pulls it within the hour
                            ("rcctl cmd update check" to make it look now)
-  rcctl update             build, then push it over the LAN (when this machine can reach the controller)
+  rcctl update             build and publish, then also push it over the LAN (when this machine can reach the controller)
   rcctl status             the controller's state (JSON)
   rcctl log [BYTES]        recent output
   rcctl cmd WORDS...       a console command, e.g. "rcctl cmd phone add aa:bb:cc:dd:ee:ff rob"
@@ -134,7 +134,9 @@ def cmd(text):
 
 
 def push_update():
-    build()
+    # Publish the same build first: the board checks bedichek.org hourly and would otherwise replace a LAN-pushed
+    # build with whatever was last published (or, with nothing published, roll it back after 2 minutes).
+    publish()
     boundary = uuid.uuid4().hex
     body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"firmware\"; filename=\"recirc.bin\"\r\n"
             "Content-Type: application/octet-stream\r\n\r\n").encode() + open(BIN, "rb").read() + \
