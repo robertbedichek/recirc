@@ -128,7 +128,9 @@ def request(path, data=None, timeout=10, headers=None):
 
 
 def cmd(text):
-    return request("/cmd", text.encode(), headers={"X-Token": token("lan_token")})
+    # text/plain: with urllib's default form encoding the board's WebServer parses the body as form fields
+    # and server.arg("plain") comes back empty.
+    return request("/cmd", text.encode(), headers={"X-Token": token("lan_token"), "Content-Type": "text/plain"})
 
 
 def push_update():
