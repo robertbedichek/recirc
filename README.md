@@ -14,16 +14,24 @@ Controller for the hot-water recirculation pump at the house: a Waveshare
 - **Someone is home** when one of these happened within the last 60 minutes:
   - A family phone was seen on the house Wi-Fi. Every 2 minutes it sweeps the local /24 for their MAC
     addresses using ARP, the network's address lookup.
+  - Any other device with a private (randomized) Wi-Fi address was seen in the same sweep. Phones, including
+    guests', join with private addresses, while routers, Hue bridges, cameras and computers left on use their
+    real ones, so this counts visitors without registering them. `guests off` turns it off; `guest ignore <mac>`
+    excludes a private-address device that is always there (an iPad left at the cabin, say). `guests` lists
+    what it has seen.
   - A Hue light was switched or dimmed. It polls the bridge's local API every minute.
-  
-  With neither configured it assumes someone is home. `mode home` and `mode away` override this.
+
+  With all of these off it assumes someone is home. `mode home` and `mode away` override this.
 - **Time** comes from NTP and is kept across outages by the onboard PCF85063 clock chip, which holds UTC.
   The schedule uses Pacific time.
 - **Telemetry** is posted to `https://bedichek.org/home/api/ingest/recirc`, appending to
   `/var/www/html/home/recirc.txt`. Lines containing "alert" go to Pushover, as for the solar controllers.
   - `YYYY-MM-DD HH:MM:SS run schedule warm secs 34 start 61.2 end 65.4 peak 65.6`
-  - `YYYY-MM-DD HH:MM:SS status T 64.2 home 1 phone 12 hue 45 lights 3/41 runs 14 secs 410 rssi -62`,
-    every 5 minutes. `phone` and `hue` are minutes since last seen, -1 meaning never.
+  - `YYYY-MM-DD HH:MM:SS status T 64.2 home 1 phone 12 guest 3 devices 2 hue 45 lights 3/41 runs 14 secs 410 rssi -62`,
+    every 5 minutes. `phone`, `guest` and `hue` are minutes since last seen, -1 meaning never; `devices` is how
+    many guest devices were seen within the hold time.
+  - `YYYY-MM-DD HH:MM:SS arrive guest 1 present 2` when a family phone or guest device shows up after being away
+    longer than the hold time. recirc.txt is public, so these lines carry no MAC addresses or names.
 - **Firmware updates are pulled**, because the house LAN isn't reachable from Palo Alto.
   - Every hour it reads `recirc.json` from `https://bedichek.org/home/api/fw/recirc/` and, if the build
     differs, downloads `recirc.bin`, checks its SHA-256 and installs it.
@@ -70,5 +78,6 @@ the PCF85063 clock chip on I2C SDA 39, SCL 38 (address 0x51), RS485 on 17/18/21 
 ## Commands
 
 `run`, `stop`, `mode auto|home|away`, `set interval|maxrun|rise|hold|quiet <v>`, `phone add|del`, `phones`,
+`guests [on|off]`, `guest ignore|unignore <mac>`,
 `hue pair <ip>|forget`, `upload on|off`, `update check`, `reboot`. Send them over USB serial, or with
 `./rcctl cmd ...` on the LAN.

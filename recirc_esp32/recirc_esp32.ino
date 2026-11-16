@@ -9,9 +9,10 @@
 //   max_run_s seconds, whichever comes first.  The "run now" button (IO2) runs it regardless of presence or the
 //   hour.  The pump never runs without a working return-line temperature.
 //
-//   Someone is home when a family phone has been seen on the Wi-Fi (ARP sweep of the local /24 for their MACs)
-//   or a Hue light has changed (polled from the bridge's local API) within the last hold_min minutes.  With
-//   neither source configured it assumes someone is home.  "mode home|away" overrides.
+//   Someone is home when, within the last hold_min minutes, a family phone has been seen on the Wi-Fi (ARP sweep
+//   of the local /24 for their MACs), any other device with a private (randomized) Wi-Fi address has been seen
+//   ("guests", on by default: visitors' phones; fixed gear uses real MACs), or a Hue light has changed (polled
+//   from the bridge's local API).  With all of these off it assumes someone is home.  "mode home|away" overrides.
 //
 // Hardware:
 //   IO47  relay (high = closed = pump on)
@@ -32,6 +33,7 @@
 //   mode auto|home|away             presence from phones and Hue | always home | never on schedule
 //   set interval|maxrun|rise|hold|quiet <value>   (quiet takes "23-7"; "set" alone lists them)
 //   phone add <mac> <name> | phone del <mac> | phones
+//   guests [on|off] | guest ignore|unignore <mac>   (a private-address device that is always there, e.g. an iPad)
 //   hue pair <ip> (press the bridge's link button first) | hue forget
 //   upload on|off | update check | reboot | help
 
@@ -82,6 +84,8 @@ struct Settings {
   char mode = 'a';            // 'a' auto (presence), 'h' always home, 'w' away (no scheduled runs)
   bool upload = false;        // Send telemetry to bedichek.org
   String phones;              // "aa:bb:cc:dd:ee:ff=name;..." lower case
+  bool guests = true;         // Any device with a private (randomized) Wi-Fi address counts too: guests' phones
+  String ignore;              // "aa:bb:cc:dd:ee:ff;..." private-address devices that never mean someone is home
   String hue_ip;
   String hue_user;            // The bridge's API key from "hue pair"
 } cfg;
@@ -100,6 +104,8 @@ void save_settings(void)
   prefs.putChar("mode", cfg.mode);
   prefs.putBool("upload", cfg.upload);
   prefs.putString("phones", cfg.phones);
+  prefs.putBool("guests", cfg.guests);
+  prefs.putString("ignore", cfg.ignore);
   prefs.putString("hue_ip", cfg.hue_ip);
   prefs.putString("hue_user", cfg.hue_user);
   prefs.end();
@@ -117,6 +123,8 @@ void load_settings(void)
   cfg.mode = prefs.getChar("mode", cfg.mode);
   cfg.upload = prefs.getBool("upload", cfg.upload);
   cfg.phones = prefs.getString("phones", "");
+  cfg.guests = prefs.getBool("guests", cfg.guests);
+  cfg.ignore = prefs.getString("ignore", "");
   cfg.hue_ip = prefs.getString("hue_ip", "");
   cfg.hue_user = prefs.getString("hue_user", "");
   prefs.end();
@@ -351,6 +359,15 @@ unsigned long hue_change_ms = 0;      // millis() of the last Hue light change, 
 int hue_lights = -1, hue_lights_on = -1;
 bool hue_error_reported = false;
 
+// Guests: any other device answering ARP with a locally administered (private, randomized) MAC.  Phones use these
+// on Wi-Fi; routers, Hue bridges, cameras and computers left on use their real MACs, so they never count.
+struct Guest { uint8_t mac[6]; unsigned long seen_ms; uint32_t ip; };
+Guest guests[24];
+int guest_count = 0;
+uint8_t ignored[16][6];
+int ignored_count = 0;
+int arrivals_phone = 0, arrivals_guest = 0;  // Counted in lwIP's thread (presence_mutex held), logged by the presence task
+
 bool parse_mac(const String &s, uint8_t mac[6])
 {
   unsigned v[6];
@@ -392,6 +409,47 @@ void load_phones(void)            // From cfg.phones; keeps the last-seen times 
   xSemaphoreGive(presence_mutex);
 }
 
+void load_ignores(void)           // From cfg.ignore; also drops those devices from the guest table
+{
+  xSemaphoreTake(presence_mutex, portMAX_DELAY);
+  ignored_count = 0;
+  int start = 0;
+  while (start < (int)cfg.ignore.length() && ignored_count < 16) {
+    int end = cfg.ignore.indexOf(';', start);
+    if (end < 0) end = cfg.ignore.length();
+    if (parse_mac(cfg.ignore.substring(start, end), ignored[ignored_count])) ignored_count++;
+    start = end + 1;
+  }
+  for (int i = 0; i < guest_count; ) {
+    bool drop = false;
+    for (int k = 0; k < ignored_count; k++) if (memcmp(guests[i].mac, ignored[k], 6) == 0) drop = true;
+    if (drop) guests[i] = guests[--guest_count]; else i++;
+  }
+  xSemaphoreGive(presence_mutex);
+}
+
+bool private_mac(const uint8_t m[6]) { return (m[0] & 0x02) && !(m[0] & 0x01); }   // Locally administered unicast
+
+unsigned long last_guest_ms(void)     // millis() a guest device was last seen, 0 if never
+{
+  unsigned long best = 0;
+  xSemaphoreTake(presence_mutex, portMAX_DELAY);
+  for (int i = 0; i < guest_count; i++)
+    if (best == 0 || (long)(guests[i].seen_ms - best) > 0) best = guests[i].seen_ms;
+  xSemaphoreGive(presence_mutex);
+  return best;
+}
+
+int guests_present(void)             // Guest devices seen within the hold time
+{
+  int n = 0;
+  xSemaphoreTake(presence_mutex, portMAX_DELAY);
+  for (int i = 0; i < guest_count; i++)
+    if (millis() - guests[i].seen_ms < (unsigned long)cfg.hold_min * 60000UL) n++;
+  xSemaphoreGive(presence_mutex);
+  return n;
+}
+
 unsigned long last_phone_ms(void)     // millis() a family phone was last seen, 0 if never
 {
   unsigned long best = 0;
@@ -410,8 +468,9 @@ bool someone_home(void)
   if (cfg.mode == 'h') return true;
   if (cfg.mode == 'w') return false;
   bool have_phones = phone_count > 0, have_hue = cfg.hue_user.length() > 0;
-  if (!have_phones && !have_hue) return true;            // Nothing to go on: assume yes
-  return recent(last_phone_ms(), cfg.hold_min) || recent(hue_change_ms, cfg.hold_min);
+  if (!have_phones && !have_hue && !cfg.guests) return true;   // Nothing to go on: assume yes
+  return recent(last_phone_ms(), cfg.hold_min) || recent(hue_change_ms, cfg.hold_min) ||
+         (cfg.guests && recent(last_guest_ms(), cfg.hold_min));
 }
 
 // lwIP's raw ARP calls must run in its own thread
@@ -439,19 +498,41 @@ static void arp_scan_table(void *arg)
     struct netif *nif;
     struct eth_addr *eth;
     if (etharp_get_entry(i, &ip, &nif, &eth) != 1) continue;
+    unsigned long now = millis(), hold = (unsigned long)cfg.hold_min * 60000UL;
+    bool family = false;
     for (int p = 0; p < phone_count; p++) {
       if (memcmp(phones[p].mac, eth->addr, 6) == 0) {
-        phones[p].seen_ms = millis();
+        if (phones[p].seen_ms == 0 || now - phones[p].seen_ms >= hold) arrivals_phone++;
+        phones[p].seen_ms = now;
         phones[p].ip = ip->addr;
+        family = true;
       }
     }
+    if (family || !cfg.guests || !private_mac(eth->addr)) continue;
+    bool skip = false;
+    for (int k = 0; k < ignored_count; k++) if (memcmp(ignored[k], eth->addr, 6) == 0) skip = true;
+    if (skip) continue;
+    int g = 0;
+    while (g < guest_count && memcmp(guests[g].mac, eth->addr, 6) != 0) g++;
+    if (g == guest_count) {                       // New: take a free slot, or the one seen longest ago
+      if (guest_count < 24) guest_count++;
+      else {
+        g = 0;
+        for (int k = 1; k < 24; k++) if ((long)(guests[k].seen_ms - guests[g].seen_ms) < 0) g = k;
+      }
+      memcpy(guests[g].mac, eth->addr, 6);
+      guests[g].seen_ms = 0;
+    }
+    if (guests[g].seen_ms == 0 || now - guests[g].seen_ms >= hold) arrivals_guest++;
+    guests[g].seen_ms = now;
+    guests[g].ip = ip->addr;
   }
   xSemaphoreGive(job->done);
 }
 
 void phone_sweep(void)            // ARP every address in our /24, a few at a time so the small ARP table keeps up
 {
-  if (phone_count == 0 || WiFi.status() != WL_CONNECTED) return;
+  if ((phone_count == 0 && !cfg.guests) || WiFi.status() != WL_CONNECTED) return;
   uint32_t me = ntohl((uint32_t)WiFi.localIP());
   uint32_t mask = ntohl((uint32_t)WiFi.subnetMask());
   if (mask != 0xffffff00) mask = 0xffffff00;  // Only ever sweep a /24
@@ -558,7 +639,18 @@ void presence_task(void *arg)
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(1000));
     if (millis() - last_hue > 60000 || last_hue == 0) { last_hue = millis(); hue_poll(); }
-    if (millis() - last_sweep > 120000 || last_sweep == 0) { last_sweep = millis(); phone_sweep(); }
+    if (millis() - last_sweep > 120000 || last_sweep == 0) {
+      last_sweep = millis();
+      phone_sweep();
+      // "YYYY-MM-DD HH:MM:SS arrive guest 1 present 2": devices not seen within the hold time came back.  No MACs
+      // or names: recirc.txt is public.
+      if (time_valid && (arrivals_phone || arrivals_guest)) {
+        int p = arrivals_phone, g = arrivals_guest;
+        arrivals_phone = arrivals_guest = 0;
+        if (p) out.println(timestamp() + " arrive phone " + String(p) + " present " + String(guests_present()));
+        if (g) out.println(timestamp() + " arrive guest " + String(g) + " present " + String(guests_present()));
+      }
+    }
   }
 }
 
@@ -675,8 +767,9 @@ void watch_button(void)           // Called every 100 ms; a press of 0.2 s or mo
 
 // ---------------------------------------------------------------------------------------------------------------
 // Periodic status line, every 5 minutes:
-//   YYYY-MM-DD HH:MM:SS status T 64.2 home 1 phone 12 hue 45 lights 3/41 runs 14 secs 410 rssi -62
-// phone and hue are minutes since last seen (-1 never); T is "-" without a probe reading.
+//   YYYY-MM-DD HH:MM:SS status T 64.2 home 1 phone 12 guest 3 devices 2 hue 45 lights 3/41 runs 14 secs 410 rssi -62
+// phone, guest and hue are minutes since last seen (-1 never); devices is guest devices seen within the hold time;
+// T is "-" without a probe reading.
 
 String minutes_since(unsigned long ms) { return ms == 0 ? String("-1") : String((millis() - ms) / 60000UL); }
 
@@ -686,7 +779,8 @@ void status_line(void)
   char t[12];
   if (probe_ok()) snprintf(t, sizeof(t), "%.1f", return_F); else strcpy(t, "-");
   out.println(timestamp() + " status T " + t + " home " + (someone_home() ? "1" : "0") +
-              " phone " + minutes_since(last_phone_ms()) + " hue " + minutes_since(hue_change_ms) +
+              " phone " + minutes_since(last_phone_ms()) + " guest " + minutes_since(last_guest_ms()) +
+              " devices " + String(guests_present()) + " hue " + minutes_since(hue_change_ms) +
               " lights " + String(hue_lights_on) + "/" + String(hue_lights) +
               " runs " + String(runs_today) + " secs " + String(run_seconds_today) + " rssi " + String(WiFi.RSSI()));
 }
@@ -696,10 +790,10 @@ void status_line(void)
 
 String settings_text(void)
 {
-  char b[200];
-  snprintf(b, sizeof(b), "interval %d min, maxrun %d s, rise %.1f F, hold %d min, quiet %d-%d, mode %s, upload %s",
+  char b[220];
+  snprintf(b, sizeof(b), "interval %d min, maxrun %d s, rise %.1f F, hold %d min, quiet %d-%d, mode %s, guests %s, upload %s",
            cfg.interval_min, cfg.max_run_s, cfg.rise_F, cfg.hold_min, cfg.quiet_start_h, cfg.quiet_end_h,
-           cfg.mode == 'h' ? "home" : cfg.mode == 'w' ? "away" : "auto", cfg.upload ? "on" : "off");
+           cfg.mode == 'h' ? "home" : cfg.mode == 'w' ? "away" : "auto", cfg.guests ? "on" : "off", cfg.upload ? "on" : "off");
   return String(b);
 }
 
@@ -776,6 +870,36 @@ String run_command(String c)
     xSemaphoreGive(presence_mutex);
     return r.length() ? r : String("no phones listed");
   }
+  if (verb == "guests" || verb == "guest") {
+    if (rest == "on" || rest == "off") { cfg.guests = rest == "on"; save_settings(); log_event("guests " + rest); }
+    else if (rest.startsWith("ignore ") || rest.startsWith("unignore ")) {
+      bool add = rest.startsWith("ignore ");
+      uint8_t m[6];
+      if (!parse_mac(rest.substring(rest.indexOf(' ') + 1), m)) return "guest ignore|unignore <aa:bb:cc:dd:ee:ff>";
+      String key = mac_text(m), kept;
+      int start = 0;
+      while (start < (int)cfg.ignore.length()) {
+        int end = cfg.ignore.indexOf(';', start);
+        if (end < 0) end = cfg.ignore.length();
+        String item = cfg.ignore.substring(start, end);
+        if (item.length() && item != key) kept += (kept.length() ? ";" : "") + item;
+        start = end + 1;
+      }
+      if (add) kept += (kept.length() ? ";" : "") + key;
+      cfg.ignore = kept;
+      save_settings();
+      log_event(String(add ? "ignoring" : "no longer ignoring") + " a private-address device");
+    }
+    load_ignores();
+    String r = String("guests ") + (cfg.guests ? "on" : "off") + "\n";
+    xSemaphoreTake(presence_mutex, portMAX_DELAY);
+    for (int i = 0; i < guest_count; i++)
+      r += mac_text(guests[i].mac) + " last seen " + String((millis() - guests[i].seen_ms) / 60000UL) + " min ago at " +
+           IPAddress(guests[i].ip).toString() + "\n";
+    for (int k = 0; k < ignored_count; k++) r += mac_text(ignored[k]) + " ignored\n";
+    xSemaphoreGive(presence_mutex);
+    return r;
+  }
   if (verb == "hue") {
     if (rest.startsWith("pair ")) return hue_pair(rest.substring(5));
     if (rest == "forget") { cfg.hue_ip = ""; cfg.hue_user = ""; save_settings(); return "Hue forgotten"; }
@@ -788,7 +912,7 @@ String run_command(String c)
   }
   if (verb == "update") { update_check_requested = true; return "checking for new firmware"; }
   if (verb == "reboot") { stop_run("reboot"); log_event("rebooting on command"); delay(300); ESP.restart(); return ""; }
-  return "run | stop | mode auto|home|away | set ... | phone add|del ... | phones | hue pair <ip>|forget | upload on|off | update check | reboot";
+  return "run | stop | mode auto|home|away | set ... | phone add|del ... | phones | guests [on|off] | guest ignore|unignore <mac> | hue pair <ip>|forget | upload on|off | update check | reboot";
 }
 
 void watch_serial(void)
@@ -836,6 +960,8 @@ void handle_status(void)
   s += "  \"probe_errors\": " + String(probe_errors) + ",\n";
   s += "  \"someone_home\": " + String(someone_home() ? "true" : "false") + ",\n";
   s += "  \"phone_min_ago\": " + minutes_since(last_phone_ms()) + ",\n";
+  s += "  \"guest_min_ago\": " + minutes_since(last_guest_ms()) + ",\n";
+  s += "  \"guest_devices\": " + String(guests_present()) + ",\n";
   s += "  \"hue_change_min_ago\": " + minutes_since(hue_change_ms) + ",\n";
   s += "  \"hue_lights_on\": " + String(hue_lights_on) + ",\n";
   s += "  \"runs_today\": " + String(runs_today) + ",\n";
@@ -1132,6 +1258,7 @@ void setup(void)
   upload_queue.init(512 * 1024);            // In PSRAM: days of telemetry if bedichek.org is unreachable
   load_settings();
   load_phones();
+  load_ignores();
   setup_reset_cause();
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 100000);
   Wire.setTimeOut(25);
