@@ -300,6 +300,8 @@ void find_probe(void)
 
 bool probe_ok(void) { return return_ms != 0 && millis() - return_ms < 5000; }
 
+unsigned long probe_alert_ms;     // When "no probe" was last alerted, 0 once the probe is back
+
 void read_probe(void)             // Called every 100 ms
 {
   static unsigned long last_search;
@@ -307,7 +309,11 @@ void read_probe(void)             // Called every 100 ms
     if (millis() - last_search > 30000) {
       last_search = millis();
       find_probe();
-      if (!probe_found) log_event("alert no return-line probe on the 1-Wire bus");
+      if (!probe_found && (probe_alert_ms == 0 || millis() - probe_alert_ms > 3600000UL)) {   // Then hourly, not every 30 s
+        probe_alert_ms = millis();
+        log_event("alert no return-line probe on the 1-Wire bus");
+      }
+      if (probe_found) probe_alert_ms = 0;
     }
     return;
   }
@@ -579,7 +585,9 @@ void start_run(int why)     // why: T_SCHEDULE, T_BUTTON or T_COMMAND
 {
   if (pump_running) return;
   if (!probe_ok()) {
-    log_event(String("alert recirc ") + trigger_names[why] + " run skipped: no return-line temperature");
+    // A button or command run always alerts; a scheduled one only when "no probe" hasn't just been alerted
+    bool quiet = why == T_SCHEDULE && probe_alert_ms != 0 && millis() - probe_alert_ms < 3600000UL;
+    log_event(String(quiet ? "" : "alert ") + "recirc " + trigger_names[why] + " run skipped: no return-line temperature");
     return;
   }
   pump_running = true;
