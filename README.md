@@ -46,7 +46,7 @@ the PCF85063 clock chip on I2C SDA 39, SCL 38 (address 0x51), RS485 on 17/18/21 
 
 ## Bring-up
 
-1. `./rcctl wifi`: enter the cabin Wi-Fi name and password, and optionally a second network (e.g. remyfi, for
+1. `./rcctl wifi`: enter the cabin Wi-Fi name and password, and optionally a second network (e.g. your home network, for
    testing in Palo Alto). They're stored in `~/.config/recirc/wifi`, not in git. The board joins whichever of
    the two it can see, preferring the cabin's, and looks again after 3 minutes without Wi-Fi.
 2. Plug the board into this Mac by USB-C, then run `./rcctl flash`. The board has 16 MB of flash (esptool,
