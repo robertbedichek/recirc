@@ -74,6 +74,7 @@ struct Hue_Sensor {
   char model[16];
   int battery;          // Percent, -1 if the bridge reports none
   int reachable;        // 1, 0, or -1 if not reported
+  char last[20];        // state.lastupdated: the last button press or sensor event, UTC ("2026-11-18T23:20:01")
 };
 
 struct Hue_Sensor_Scan {
@@ -99,7 +100,8 @@ struct Hue_Sensor_Scan {
       else if (!strcmp(key, "modelid")) strncpy(s->cur.model, v, sizeof(s->cur.model) - 1);
       else if (!strcmp(key, "type")) strncpy(s->type, v, sizeof(s->type) - 1);
     } else if (depth == 3) {                 // "config": {"on": true, "battery": 87, "reachable": true, ...}
-      if (!strcmp(key, "battery") && v[0] >= '0' && v[0] <= '9') s->cur.battery = atoi_(v);
+      if (!strcmp(key, "lastupdated") && v[0] >= '0' && v[0] <= '9') strncpy(s->cur.last, v, sizeof(s->cur.last) - 1);
+      else if (!strcmp(key, "battery") && v[0] >= '0' && v[0] <= '9') s->cur.battery = atoi_(v);
       else if (!strcmp(key, "reachable")) s->cur.reachable = !strcmp(v, "true");
     }
   }

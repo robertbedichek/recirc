@@ -731,7 +731,7 @@ String hue_batteries_text(void)      // For the "hue batteries" command (LAN tok
   for (int i = 0; i < hue_batt_count; i++) {
     Hue_Battery &h = hue_batts[i];
     r += String(h.bridge_octet) + "." + h.s.id + "  " + String(h.s.battery) + "%  " + (h.s.reachable == 0 ? "unreachable  " : "") +
-         h.s.model + "  " + h.s.name + "\n";
+         h.s.model + "  " + h.s.name + (h.s.last[0] ? String("  last event ") + h.s.last + " UTC" : String("")) + "\n";
   }
   xSemaphoreGive(hue_mutex);
   return r.length() ? r : String("no battery readings yet\n");
