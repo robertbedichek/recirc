@@ -34,7 +34,8 @@
 //   set interval|maxrun|rise|hold|quiet <value>   (quiet takes "23-7"; "set" alone lists them)
 //   phone add <mac> <name> | phone del <mac> | phones
 //   guests [on|off] | guest ignore|unignore <mac>   (a private-address device that is always there, e.g. an iPad)
-//   hue pair <ip> (press the bridge's link button first) | hue forget
+//   hue pair <ip> (press the bridge's link button first; up to 4 bridges) | hue forget [ip] | hue (list bridges)
+//   hue batteries                   battery level of each Hue dimmer, button and motion sensor, with names
 //   upload on|off | update check | reboot | help
 
 #include <Arduino.h>
@@ -58,6 +59,7 @@
 
 #include "secrets.h"   // RC_WIFI_SSID, RC_WIFI_PASS (optional RC_WIFI2_SSID, RC_WIFI2_PASS), RC_LAN_TOKEN, RC_INGEST_TOKEN, RC_FW_TOKEN: written by rcctl, not in git
 #include "version.h"   // RC_BUILD_ID: written by rcctl on every build, not in git
+#include "hue_json.h"  // Streaming scanner for the Hue bridges' replies
 
 #define HOSTNAME        "recirc"
 #define RELAY_PIN       (47)
@@ -86,8 +88,7 @@ struct Settings {
   String phones;              // "aa:bb:cc:dd:ee:ff=name;..." lower case
   bool guests = true;         // Any device with a private (randomized) Wi-Fi address counts too: guests' phones
   String ignore;              // "aa:bb:cc:dd:ee:ff;..." private-address devices that never mean someone is home
-  String hue_ip;
-  String hue_user;            // The bridge's API key from "hue pair"
+  String hue;                 // "ip key\n" per paired Hue bridge (key from "hue pair")
 } cfg;
 
 Preferences prefs;
@@ -106,8 +107,9 @@ void save_settings(void)
   prefs.putString("phones", cfg.phones);
   prefs.putBool("guests", cfg.guests);
   prefs.putString("ignore", cfg.ignore);
-  prefs.putString("hue_ip", cfg.hue_ip);
-  prefs.putString("hue_user", cfg.hue_user);
+  prefs.putString("hue", cfg.hue);
+  if (prefs.isKey("hue_ip")) prefs.remove("hue_ip");          // Replaced by "hue"
+  if (prefs.isKey("hue_user")) prefs.remove("hue_user");
   prefs.end();
 }
 
@@ -125,8 +127,9 @@ void load_settings(void)
   cfg.phones = prefs.getString("phones", "");
   cfg.guests = prefs.getBool("guests", cfg.guests);
   cfg.ignore = prefs.getString("ignore", "");
-  cfg.hue_ip = prefs.getString("hue_ip", "");
-  cfg.hue_user = prefs.getString("hue_user", "");
+  cfg.hue = prefs.getString("hue", "");
+  if (cfg.hue.length() == 0 && prefs.getString("hue_user", "").length())     // One bridge, from before 2026-11-17
+    cfg.hue = prefs.getString("hue_ip", "") + " " + prefs.getString("hue_user", "") + "\n";
   prefs.end();
 }
 
@@ -355,9 +358,8 @@ struct Phone { uint8_t mac[6]; String name; unsigned long seen_ms; uint32_t ip; 
 Phone phones[12];
 int phone_count = 0;
 SemaphoreHandle_t presence_mutex;
-unsigned long hue_change_ms = 0;      // millis() of the last Hue light change, 0 if none since boot
-int hue_lights = -1, hue_lights_on = -1;
-bool hue_error_reported = false;
+unsigned long hue_change_ms = 0;      // millis() of the last Hue light change on any bridge, 0 if none since boot
+int hue_lights = -1, hue_lights_on = -1;   // Totals over the bridges
 
 // Guests: any other device answering ARP with a locally administered (private, randomized) MAC.  Phones use these
 // on Wi-Fi; routers, Hue bridges, cameras and computers left on use their real MACs, so they never count.
@@ -467,7 +469,7 @@ bool someone_home(void)
 {
   if (cfg.mode == 'h') return true;
   if (cfg.mode == 'w') return false;
-  bool have_phones = phone_count > 0, have_hue = cfg.hue_user.length() > 0;
+  bool have_phones = phone_count > 0, have_hue = cfg.hue.length() > 0;
   if (!have_phones && !have_hue && !cfg.guests) return true;   // Nothing to go on: assume yes
   return recent(last_phone_ms(), cfg.hold_min) || recent(hue_change_ms, cfg.hold_min) ||
          (cfg.guests && recent(last_guest_ms(), cfg.hold_min));
@@ -553,29 +555,68 @@ void phone_sweep(void)            // ARP every address in our /24, a few at a ti
   vSemaphoreDelete(job.done);
 }
 
-// Hue: GET /api/<key>/lights and fingerprint every light's "on" and "bri".  A changed fingerprint means someone
-// switched or dimmed a light.  Streams the reply rather than parsing it whole, since big houses send 50 KB+.
-uint32_t hue_fingerprint = 0;
-bool hue_have_fingerprint = false;
+// Hue: up to four bridges (the cabin has three).  Every minute, GET /api/<key>/lights from each and fingerprint every
+// light's "on" and "bri": a changed fingerprint means someone switched or dimmed a light.  Streams the reply rather
+// than parsing it whole, since big houses send 50 KB+.
+//
+// Once after boot and then daily at 09:00, read each bridge's battery-powered accessories (dimmers, buttons,
+// motion sensors) and its Zigbee channel, and log data lines:
+//   YYYY-MM-DD HH:MM:SS hue battery 143.2 87 reachable 1 model RWL021
+//   YYYY-MM-DD HH:MM:SS hue radio 143 zigbee 25 wifi 6
+// 143.2 is the bridge's last address byte and the accessory's id on it; "hue batteries" shows their names, which stay
+// out of recirc.txt because it is public.  wifi is the 2.4 GHz channel of the access point this board is on.
+// A battery at 15% or less is alerted once (again only after it has been above 30%).
 
-void hue_poll(void)
+// struct Hue_Bridge is in hue_json.h, ahead of the prototypes the Arduino build adds.
+#define HUE_MAX_BRIDGES (4)
+#define HUE_MAX_SENSORS (40)
+Hue_Bridge bridges[HUE_MAX_BRIDGES];
+int bridge_count = 0;
+volatile bool hue_reload = true;       // cfg.hue changed: rebuild bridges[] (presence task)
+volatile bool hue_batt_pending = true; // Read the batteries soon (after boot or pairing)
+
+struct Hue_Battery { Hue_Sensor s; int bridge_octet; bool alerted; };
+Hue_Battery hue_batts[HUE_MAX_SENSORS];
+int hue_batt_count = 0;
+SemaphoreHandle_t hue_mutex;           // Guards bridges[] counts and hue_batts[] for the command handlers
+
+int ip_octet(const String &ip) { int dot = ip.lastIndexOf('.'); return dot < 0 ? 0 : ip.substring(dot + 1).toInt(); }
+
+void load_bridges(void)                // From cfg.hue; presence task only
 {
-  if (cfg.hue_user.length() == 0 || WiFi.status() != WL_CONNECTED) return;
+  xSemaphoreTake(hue_mutex, portMAX_DELAY);
+  bridge_count = 0;
+  int at = 0;
+  while (at < (int)cfg.hue.length() && bridge_count < HUE_MAX_BRIDGES) {
+    int nl = cfg.hue.indexOf('\n', at);
+    if (nl < 0) nl = cfg.hue.length();
+    String line = cfg.hue.substring(at, nl);
+    at = nl + 1;
+    int sp = line.indexOf(' ');
+    if (sp <= 0) continue;
+    Hue_Bridge &b = bridges[bridge_count++];
+    b.ip = line.substring(0, sp);
+    b.key = line.substring(sp + 1);
+    b.have_fingerprint = b.error_reported = false;
+    b.lights = b.lights_on = b.zigbee_channel = -1;
+  }
+  xSemaphoreGive(hue_mutex);
+}
+
+// GET http://<bridge>/api/<key>/<what> and feed the reply to j.  False (after one alert per outage) on failure.
+bool hue_get(Hue_Bridge &b, const char *what, Json_Scan &j, bool *saw_error)
+{
   HTTPClient http;
   http.setTimeout(8000);
-  if (!http.begin("http://" + cfg.hue_ip + "/api/" + cfg.hue_user + "/lights")) return;
+  if (!http.begin("http://" + b.ip + "/api/" + b.key + "/" + what)) return false;
   int code = http.GET();
   if (code != 200) {
-    if (!hue_error_reported) { log_event("alert Hue bridge at " + cfg.hue_ip + " answered " + String(code)); hue_error_reported = true; }
+    if (!b.error_reported) { log_event("alert Hue bridge at " + b.ip + " answered " + String(code)); b.error_reported = true; }
     http.end();
-    return;
+    return false;
   }
   NetworkClient *s = http.getStreamPtr();
-  uint32_t h = 2166136261u;                   // FNV-1a over the values that follow "on": and "bri":
-  int lights = 0, on = 0;
-  char win[7] = {0};                          // The last six characters seen
-  int capture = 0;                            // 1 after "on":, 2 after "bri":
-  bool saw_error = false;
+  char win[7] = {0};                          // The last six characters seen, to spot {"error": ...}
   unsigned long deadline = millis() + 8000;
   int remaining = http.getSize();             // -1 when chunked
   while (http.connected() && millis() < deadline && remaining != 0) {
@@ -584,34 +625,154 @@ void hue_poll(void)
     if (remaining > 0) remaining--;
     memmove(win, win + 1, 5);
     win[5] = (char)c;
-    if (capture) {
-      if (c == ',' || c == '}') { capture = 0; h = (h ^ '|') * 16777619u; continue; }
-      h = (h ^ (uint8_t)c) * 16777619u;
-      if (capture == 1 && c == 't') on++;     // "on":true
-      continue;
-    }
-    if (memcmp(win + 1, "\"on\":", 5) == 0) { capture = 1; lights++; }
-    else if (memcmp(win, "\"bri\":", 6) == 0) capture = 2;
-    else if (memcmp(win, "error\"", 6) == 0) saw_error = true;
+    if (memcmp(win, "error\"", 6) == 0) *saw_error = true;
+    j.feed((char)c);
   }
   http.end();
-  if (saw_error && lights == 0) {
-    if (!hue_error_reported) { log_event("alert the Hue bridge rejected our key; run \"hue pair\" again"); hue_error_reported = true; }
-    return;
+  return true;
+}
+
+// Fingerprint of the lights: FNV-1a over every "on" and "bri" value.
+struct Light_Scan {
+  uint32_t h = 2166136261u;
+  int lights = 0, on = 0;
+  static void value(void *ctx, int depth, const char *key, const char *v)
+  {
+    Light_Scan *l = (Light_Scan *)ctx;
+    if (depth != 3) return;                   // {"1": {"state": {"on": true, "bri": 254, ...}, ...}, ...}
+    bool is_on = !strcmp(key, "on");
+    if (!is_on && strcmp(key, "bri")) return;
+    if (is_on) { l->lights++; if (!strcmp(v, "true")) l->on++; }
+    for (const char *p = v; *p; p++) l->h = (l->h ^ (uint8_t)*p) * 16777619u;
+    l->h = (l->h ^ '|') * 16777619u;
   }
-  hue_error_reported = false;
-  if (hue_have_fingerprint && h != hue_fingerprint) {
-    hue_change_ms = millis();
-    log_event("hue change: " + String(on) + " of " + String(lights) + " lights on");
+};
+
+void hue_poll(void)
+{
+  if (WiFi.status() != WL_CONNECTED) return;
+  int total = 0, total_on = 0, answered = 0;
+  for (int i = 0; i < bridge_count; i++) {
+    Hue_Bridge &b = bridges[i];
+    Json_Scan j;
+    Light_Scan l;
+    j.ctx = &l; j.on_value = Light_Scan::value;
+    bool saw_error = false;
+    if (!hue_get(b, "lights", j, &saw_error)) continue;
+    if (saw_error && l.lights == 0) {
+      if (!b.error_reported) { log_event("alert the Hue bridge at " + b.ip + " rejected our key; run \"hue pair " + b.ip + "\" again"); b.error_reported = true; }
+      continue;
+    }
+    b.error_reported = false;
+    if (b.have_fingerprint && l.h != b.fingerprint) {
+      hue_change_ms = millis();
+      log_event("hue change at " + b.ip + ": " + String(l.on) + " of " + String(l.lights) + " lights on");
+    }
+    b.fingerprint = l.h;
+    b.have_fingerprint = true;
+    b.lights = l.lights;
+    b.lights_on = l.on;
+    total += l.lights;
+    total_on += l.on;
+    answered++;
   }
-  hue_fingerprint = h;
-  hue_have_fingerprint = true;
-  hue_lights = lights;
-  hue_lights_on = on;
+  hue_lights = answered ? total : -1;
+  hue_lights_on = answered ? total_on : -1;
+}
+
+void hue_battery_read(void)
+{
+  if (WiFi.status() != WL_CONNECTED || !time_valid) return;
+  static Hue_Battery fresh[HUE_MAX_SENSORS];
+  int n = 0;
+  for (int i = 0; i < bridge_count; i++) {
+    Hue_Bridge &b = bridges[i];
+    bool saw_error = false;
+    Json_Scan jc;
+    Hue_Config_Scan c;
+    c.attach(jc);
+    if (hue_get(b, "config", jc, &saw_error)) b.zigbee_channel = c.zigbee_channel;
+    out.println(timestamp() + " hue radio " + String(ip_octet(b.ip)) + " zigbee " + String(b.zigbee_channel) +
+                " wifi " + String(WiFi.channel()));
+
+    static Hue_Sensor found[HUE_MAX_SENSORS];
+    Json_Scan js;
+    Hue_Sensor_Scan ss;
+    ss.attach(js, found, HUE_MAX_SENSORS - n);
+    if (!hue_get(b, "sensors", js, &saw_error)) continue;
+    for (int k = 0; k < ss.count; k++) {
+      Hue_Battery &h = fresh[n++];
+      h.s = found[k];
+      h.bridge_octet = ip_octet(b.ip);
+      h.alerted = false;
+      xSemaphoreTake(hue_mutex, portMAX_DELAY);
+      for (int m = 0; m < hue_batt_count; m++)            // Carry the alert state over from the last reading
+        if (hue_batts[m].bridge_octet == h.bridge_octet && !strcmp(hue_batts[m].s.id, h.s.id)) h.alerted = hue_batts[m].alerted;
+      xSemaphoreGive(hue_mutex);
+      String tag = String(h.bridge_octet) + "." + h.s.id;
+      out.println(timestamp() + " hue battery " + tag + " " + String(h.s.battery) + " reachable " + String(h.s.reachable) +
+                  " model " + (h.s.model[0] ? h.s.model : "-"));
+      if (h.s.battery <= 15 && !h.alerted) {
+        log_event("alert Hue " + String(h.s.model) + " " + tag + " battery " + String(h.s.battery) + "% (\"hue batteries\" names it)");
+        h.alerted = true;
+      } else if (h.s.battery > 30) h.alerted = false;
+    }
+  }
+  xSemaphoreTake(hue_mutex, portMAX_DELAY);
+  memcpy(hue_batts, fresh, sizeof(Hue_Battery) * n);
+  hue_batt_count = n;
+  xSemaphoreGive(hue_mutex);
+}
+
+String hue_batteries_text(void)      // For the "hue batteries" command (LAN token or USB only): includes names
+{
+  String r;
+  xSemaphoreTake(hue_mutex, portMAX_DELAY);
+  for (int i = 0; i < hue_batt_count; i++) {
+    Hue_Battery &h = hue_batts[i];
+    r += String(h.bridge_octet) + "." + h.s.id + "  " + String(h.s.battery) + "%  " + (h.s.reachable == 0 ? "unreachable  " : "") +
+         h.s.model + "  " + h.s.name + "\n";
+  }
+  xSemaphoreGive(hue_mutex);
+  return r.length() ? r : String("no battery readings yet\n");
+}
+
+String hue_bridges_text(void)
+{
+  if (cfg.hue.length() == 0) return "not paired; hue pair <bridge ip>";
+  String r;
+  xSemaphoreTake(hue_mutex, portMAX_DELAY);
+  for (int i = 0; i < bridge_count; i++)
+    r += bridges[i].ip + ": " + String(bridges[i].lights_on) + " of " + String(bridges[i].lights) + " lights on, zigbee channel " +
+         String(bridges[i].zigbee_channel) + "\n";
+  xSemaphoreGive(hue_mutex);
+  return r + "this board's Wi-Fi channel " + String(WiFi.channel());
+}
+
+String hue_set_bridge(const String &ip, const String &key)    // key "" removes the bridge
+{
+  String kept, line;
+  int at = 0;
+  while (at < (int)cfg.hue.length()) {
+    int nl = cfg.hue.indexOf('\n', at);
+    if (nl < 0) nl = cfg.hue.length();
+    line = cfg.hue.substring(at, nl);
+    at = nl + 1;
+    if (line.length() && !line.startsWith(ip + " ")) kept += line + "\n";
+  }
+  if (key.length()) kept += ip + " " + key + "\n";
+  cfg.hue = kept;
+  save_settings();
+  hue_reload = true;
+  hue_batt_pending = true;
+  return kept;
 }
 
 String hue_pair(const String &ip)
 {
+  int lines = 0;
+  for (unsigned i = 0; i < cfg.hue.length(); i++) if (cfg.hue[i] == '\n') lines++;
+  if (lines >= HUE_MAX_BRIDGES && cfg.hue.indexOf(ip + " ") < 0) return "already paired with " + String(HUE_MAX_BRIDGES) + " bridges";
   HTTPClient http;
   http.setTimeout(8000);
   if (!http.begin("http://" + ip + "/api")) return "can't reach " + ip;
@@ -619,26 +780,37 @@ String hue_pair(const String &ip)
   int code = http.POST("{\"devicetype\":\"recirc#esp32\"}");
   String body = http.getString();
   http.end();
-  int at = body.indexOf("\"username\":\"");
-  if (code != 200 || at < 0) {
+  struct Find { char user[48] = ""; } f;      // [{"success": {"username": "<key>"}}]
+  Json_Scan j;
+  j.ctx = &f;
+  j.on_value = [](void *ctx, int, const char *key, const char *v) { if (!strcmp(key, "username")) strncpy(((Find *)ctx)->user, v, 47); };
+  for (unsigned i = 0; i < body.length(); i++) j.feed(body[i]);
+  if (code != 200 || !f.user[0]) {
     if (body.indexOf("link button") >= 0) return "press the round link button on the bridge, then within 30 seconds run \"hue pair " + ip + "\" again";
     return "pairing failed (" + String(code) + ")";
   }
-  at += 12;
-  cfg.hue_ip = ip;
-  cfg.hue_user = body.substring(at, body.indexOf('"', at));
-  save_settings();
-  hue_have_fingerprint = false;
-  hue_error_reported = false;
+  hue_set_bridge(ip, f.user);
   return "paired with the Hue bridge at " + ip;
 }
 
 void presence_task(void *arg)
 {
   unsigned long last_sweep = 0, last_hue = 0;
+  int batt_yday = -1;
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(1000));
+    if (hue_reload) { hue_reload = false; load_bridges(); last_hue = 0; }
     if (millis() - last_hue > 60000 || last_hue == 0) { last_hue = millis(); hue_poll(); }
+    if (bridge_count && time_valid && millis() > 180000) {   // Batteries: 3 min after boot or pairing, then 09:00 daily
+      time_t t = time(nullptr);
+      struct tm tm;
+      localtime_r(&t, &tm);
+      if (hue_batt_pending || (tm.tm_hour >= 9 && tm.tm_yday != batt_yday)) {
+        hue_batt_pending = false;
+        if (tm.tm_hour >= 9) batt_yday = tm.tm_yday;
+        hue_battery_read();
+      }
+    }
     if (millis() - last_sweep > 120000 || last_sweep == 0) {
       last_sweep = millis();
       phone_sweep();
@@ -902,9 +1074,10 @@ String run_command(String c)
   }
   if (verb == "hue") {
     if (rest.startsWith("pair ")) return hue_pair(rest.substring(5));
-    if (rest == "forget") { cfg.hue_ip = ""; cfg.hue_user = ""; save_settings(); return "Hue forgotten"; }
-    return cfg.hue_user.length() ? "paired with " + cfg.hue_ip + ", " + String(hue_lights_on) + " of " + String(hue_lights) + " lights on"
-                                 : String("not paired; hue pair <bridge ip>");
+    if (rest == "forget") { cfg.hue = ""; save_settings(); hue_reload = true; return "all Hue bridges forgotten"; }
+    if (rest.startsWith("forget ")) { hue_set_bridge(rest.substring(7), ""); return "forgot the Hue bridge at " + rest.substring(7); }
+    if (rest == "batteries") { hue_batt_pending = bridge_count > 0; return hue_batteries_text() + "(reading them again now)"; }
+    return hue_bridges_text();
   }
   if (verb == "upload") {
     if (rest == "on" || rest == "off") { cfg.upload = rest == "on"; save_settings(); }
@@ -912,7 +1085,7 @@ String run_command(String c)
   }
   if (verb == "update") { update_check_requested = true; return "checking for new firmware"; }
   if (verb == "reboot") { stop_run("reboot"); log_event("rebooting on command"); delay(300); ESP.restart(); return ""; }
-  return "run | stop | mode auto|home|away | set ... | phone add|del ... | phones | guests [on|off] | guest ignore|unignore <mac> | hue pair <ip>|forget | upload on|off | update check | reboot";
+  return "run | stop | mode auto|home|away | set ... | phone add|del ... | phones | guests [on|off] | guest ignore|unignore <mac> | hue [pair <ip>|forget [ip]|batteries] | upload on|off | update check | reboot";
 }
 
 void watch_serial(void)
@@ -964,6 +1137,12 @@ void handle_status(void)
   s += "  \"guest_devices\": " + String(guests_present()) + ",\n";
   s += "  \"hue_change_min_ago\": " + minutes_since(hue_change_ms) + ",\n";
   s += "  \"hue_lights_on\": " + String(hue_lights_on) + ",\n";
+  s += "  \"hue_bridges\": " + String(bridge_count) + ",\n";
+  int low = -1;
+  xSemaphoreTake(hue_mutex, portMAX_DELAY);
+  for (int i = 0; i < hue_batt_count; i++) if (low < 0 || hue_batts[i].s.battery < low) low = hue_batts[i].s.battery;
+  xSemaphoreGive(hue_mutex);
+  s += "  \"hue_lowest_battery\": " + String(low) + ",\n";
   s += "  \"runs_today\": " + String(runs_today) + ",\n";
   s += "  \"run_seconds_today\": " + String(run_seconds_today) + ",\n";
   s += "  \"last_run\": \"" + last_run_text + "\",\n";
@@ -1254,6 +1433,7 @@ void setup(void)
   Serial.begin(SERIAL_BAUD);
   lines_mutex = xSemaphoreCreateMutex();
   presence_mutex = xSemaphoreCreateMutex();
+  hue_mutex = xSemaphoreCreateMutex();
   recent_lines.init(32 * 1024);
   upload_queue.init(512 * 1024);            // In PSRAM: days of telemetry if bedichek.org is unreachable
   load_settings();

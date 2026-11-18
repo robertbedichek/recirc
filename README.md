@@ -19,7 +19,8 @@ Controller for the hot-water recirculation pump at the house: a Waveshare
     real ones, so this counts visitors without registering them. `guests off` turns it off; `guest ignore <mac>`
     excludes a private-address device that is always there (an iPad left at the cabin, say). `guests` lists
     what it has seen.
-  - A Hue light was switched or dimmed. It polls the bridge's local API every minute.
+  - A Hue light was switched or dimmed. It polls each paired bridge's local API every minute (up to four
+    bridges; the cabin has three).
 
   With all of these off it assumes someone is home. `mode home` and `mode away` override this.
 - **Time** comes from NTP and is kept across outages by the onboard PCF85063 clock chip, which holds UTC.
@@ -32,6 +33,14 @@ Controller for the hot-water recirculation pump at the house: a Waveshare
     many guest devices were seen within the hold time.
   - `YYYY-MM-DD HH:MM:SS arrive guest 1 present 2` when a family phone or guest device shows up after being away
     longer than the hold time. recirc.txt is public, so these lines carry no MAC addresses or names.
+  - `YYYY-MM-DD HH:MM:SS hue battery 143.2 87 reachable 1 model RWL022`, once after boot and then daily at 09:00,
+    for every battery-powered Hue accessory (dimmers, buttons, tap dials, motion sensors). `143.2` is the
+    bridge's last address byte and the bridge's id for the accessory; `hue batteries` shows the names, which
+    stay out of recirc.txt. A battery at 15% or less is alerted once.
+  - `YYYY-MM-DD HH:MM:SS hue radio 143 zigbee 25 wifi 6` at the same time: each bridge's Zigbee channel and the
+    2.4 GHz channel of the access point the controller is on, to check them for overlap.
+  - The server's 6 AM snapshot script copies the `hue` lines into `recirc_hue.txt`, kept indefinitely, for the
+    battery chart on https://bedichek.org/home/.
 - **Firmware updates are pulled**, because the house LAN isn't reachable from Palo Alto.
   - Every hour it reads `recirc.json` from `https://bedichek.org/home/api/fw/recirc/` and, if the build
     differs, downloads `recirc.bin`, checks its SHA-256 and installs it.
@@ -71,7 +80,9 @@ the PCF85063 clock chip on I2C SDA 39, SCL 38 (address 0x51), RS485 on 17/18/21 
    - Set each family iPhone's cabin Wi-Fi to **Private Wi-Fi Address: Fixed**.
    - Read each phone's address from Settings → Wi-Fi → (network) → Wi-Fi Address.
    - `./rcctl cmd phone add aa:bb:cc:dd:ee:ff rob`
-5. Pair Hue: press the bridge's round link button, then within 30 s run `./rcctl cmd hue pair <bridge ip>`.
+5. Pair Hue: for each bridge (the cabin's are .143, .144 and .145), press its round link button, then within
+   30 s run `./rcctl cmd hue pair <bridge ip>`. `./rcctl cmd hue` lists the paired bridges with their Zigbee
+   channels.
 6. After that: `./rcctl publish`, and the board takes the new build within the hour.
    `./rcctl cmd update check` makes it look now.
 
@@ -79,5 +90,5 @@ the PCF85063 clock chip on I2C SDA 39, SCL 38 (address 0x51), RS485 on 17/18/21 
 
 `run`, `stop`, `mode auto|home|away`, `set interval|maxrun|rise|hold|quiet <v>`, `phone add|del`, `phones`,
 `guests [on|off]`, `guest ignore|unignore <mac>`,
-`hue pair <ip>|forget`, `upload on|off`, `update check`, `reboot`. Send them over USB serial, or with
+`hue` (list bridges), `hue pair <ip>`, `hue forget [ip]`, `hue batteries`, `upload on|off`, `update check`, `reboot`. Send them over USB serial, or with
 `./rcctl cmd ...` on the LAN.
