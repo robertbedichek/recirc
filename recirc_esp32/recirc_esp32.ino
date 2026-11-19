@@ -565,7 +565,9 @@ void phone_sweep(void)            // ARP every address in our /24, a few at a ti
 //   YYYY-MM-DD HH:MM:SS hue radio 143 zigbee 25 wifi 6
 // 143.2 is the bridge's last address byte and the accessory's id on it; "hue batteries" shows their names, which stay
 // out of recirc.txt because it is public.  wifi is the 2.4 GHz channel of the access point this board is on.
-// A battery at 15% or less is alerted once (again only after it has been above 30%).
+// Every hour it also checks them without logging, and alerts when one that was reachable becomes unreachable: the
+// switch has stopped working (usually a cell sagging under load).  The bridge's battery % is no guide; Hue v2
+// dimmers read 1% for months with cells still at 3.05 V (Rob's office dimmer, 2026-11-18).
 
 // struct Hue_Bridge is in hue_json.h, ahead of the prototypes the Arduino build adds.
 #define HUE_MAX_BRIDGES (4)
@@ -575,7 +577,7 @@ int bridge_count = 0;
 volatile bool hue_reload = true;       // cfg.hue changed: rebuild bridges[] (presence task)
 volatile bool hue_batt_pending = true; // Read the batteries soon (after boot or pairing)
 
-struct Hue_Battery { Hue_Sensor s; int bridge_octet; bool alerted; };
+struct Hue_Battery { Hue_Sensor s; int bridge_octet; };
 Hue_Battery hue_batts[HUE_MAX_SENSORS];
 int hue_batt_count = 0;
 SemaphoreHandle_t hue_mutex;           // Guards bridges[] counts and hue_batts[] for the command handlers
@@ -680,7 +682,7 @@ void hue_poll(void)
   hue_lights_on = answered ? total_on : -1;
 }
 
-void hue_battery_read(void)
+void hue_battery_read(bool log_lines)   // log_lines: the daily data lines; false for the hourly reachability check
 {
   if (WiFi.status() != WL_CONNECTED || !time_valid) return;
   static Hue_Battery fresh[HUE_MAX_SENSORS];
@@ -692,8 +694,9 @@ void hue_battery_read(void)
     Hue_Config_Scan c;
     c.attach(jc);
     if (hue_get(b, "config", jc, &saw_error)) b.zigbee_channel = c.zigbee_channel;
-    out.println(timestamp() + " hue radio " + String(ip_octet(b.ip)) + " zigbee " + String(b.zigbee_channel) +
-                " wifi " + String(WiFi.channel()));
+    if (log_lines)
+      out.println(timestamp() + " hue radio " + String(ip_octet(b.ip)) + " zigbee " + String(b.zigbee_channel) +
+                  " wifi " + String(WiFi.channel()));
 
     static Hue_Sensor found[HUE_MAX_SENSORS];
     Json_Scan js;
@@ -704,18 +707,20 @@ void hue_battery_read(void)
       Hue_Battery &h = fresh[n++];
       h.s = found[k];
       h.bridge_octet = ip_octet(b.ip);
-      h.alerted = false;
+      int was = -1;                                       // Reachable at the last reading since boot, -1 if unknown
       xSemaphoreTake(hue_mutex, portMAX_DELAY);
-      for (int m = 0; m < hue_batt_count; m++)            // Carry the alert state over from the last reading
-        if (hue_batts[m].bridge_octet == h.bridge_octet && !strcmp(hue_batts[m].s.id, h.s.id)) h.alerted = hue_batts[m].alerted;
+      for (int m = 0; m < hue_batt_count; m++)
+        if (hue_batts[m].bridge_octet == h.bridge_octet && !strcmp(hue_batts[m].s.id, h.s.id)) was = hue_batts[m].s.reachable;
       xSemaphoreGive(hue_mutex);
       String tag = String(h.bridge_octet) + "." + h.s.id;
-      out.println(timestamp() + " hue battery " + tag + " " + String(h.s.battery) + " reachable " + String(h.s.reachable) +
-                  " model " + (h.s.model[0] ? h.s.model : "-"));
-      if (h.s.battery <= 15 && !h.alerted) {
-        log_event("alert Hue " + String(h.s.model) + " " + tag + " battery " + String(h.s.battery) + "% (\"hue batteries\" names it)");
-        h.alerted = true;
-      } else if (h.s.battery > 30) h.alerted = false;
+      if (log_lines)
+        out.println(timestamp() + " hue battery " + tag + " " + String(h.s.battery) + " reachable " + String(h.s.reachable) +
+                    " model " + (h.s.model[0] ? h.s.model : "-"));
+      // Only a change seen since boot alerts, so reboots don't repeat alerts for accessories long gone.
+      if (was == 1 && h.s.reachable == 0)
+        log_event("alert Hue " + String(h.s.model) + " " + tag + " stopped responding (\"hue batteries\" names it)");
+      else if (was == 0 && h.s.reachable == 1)
+        log_event("Hue " + String(h.s.model) + " " + tag + " is responding again");
     }
   }
   xSemaphoreTake(hue_mutex, portMAX_DELAY);
@@ -797,6 +802,7 @@ void presence_task(void *arg)
 {
   unsigned long last_sweep = 0, last_hue = 0;
   int batt_yday = -1;
+  unsigned long last_reach = 0;
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(1000));
     if (hue_reload) { hue_reload = false; load_bridges(); last_hue = 0; }
@@ -808,7 +814,11 @@ void presence_task(void *arg)
       if (hue_batt_pending || (tm.tm_hour >= 9 && tm.tm_yday != batt_yday)) {
         hue_batt_pending = false;
         if (tm.tm_hour >= 9) batt_yday = tm.tm_yday;
-        hue_battery_read();
+        hue_battery_read(true);
+        last_reach = millis();
+      } else if (millis() - last_reach > 3600000UL) {
+        last_reach = millis();
+        hue_battery_read(false);
       }
     }
     if (millis() - last_sweep > 120000 || last_sweep == 0) {

@@ -36,7 +36,8 @@ Controller for the hot-water recirculation pump at the house: a Waveshare
   - `YYYY-MM-DD HH:MM:SS hue battery 143.2 87 reachable 1 model RWL022`, once after boot and then daily at 09:00,
     for every battery-powered Hue accessory (dimmers, buttons, tap dials, motion sensors). `143.2` is the
     bridge's last address byte and the bridge's id for the accessory; `hue batteries` shows the names, which
-    stay out of recirc.txt. A battery at 15% or less is alerted once.
+    stay out of recirc.txt. The battery % is no guide (v2 dimmers read 1% for months with the cell still at 3.05 V), so
+    instead it checks every hour, without logging, and alerts when an accessory that was reachable stops responding.
   - `YYYY-MM-DD HH:MM:SS hue radio 143 zigbee 25 wifi 6` at the same time: each bridge's Zigbee channel and the
     2.4 GHz channel of the access point the controller is on, to check them for overlap.
   - The server's 6 AM snapshot script copies the `hue` lines into `recirc_hue.txt`, kept indefinitely, for the
