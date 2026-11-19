@@ -566,8 +566,8 @@ void phone_sweep(void)            // ARP every address in our /24, a few at a ti
 // 143.2 is the bridge's last address byte and the accessory's id on it; "hue batteries" shows their names, which stay
 // out of recirc.txt because it is public.  wifi is the 2.4 GHz channel of the access point this board is on.
 // Every hour it also checks them without logging, and alerts when one that was reachable becomes unreachable: the
-// switch has stopped working (usually a cell sagging under load).  The bridge's battery % is no guide; Hue v2
-// dimmers read 1% for months with cells still at 3.05 V (Rob's office dimmer, 2026-11-18).
+// switch has stopped working (usually a cell sagging under load).  A v2 dimmer's % runs from about 3.0 V (0%) to
+// 3.25 V (100%): Rob's office dimmer read 1% at 3.05 V and 100% on a fresh cell (2026-11-18).
 
 // struct Hue_Bridge is in hue_json.h, ahead of the prototypes the Arduino build adds.
 #define HUE_MAX_BRIDGES (4)
