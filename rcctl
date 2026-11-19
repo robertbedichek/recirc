@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""rcctl: build, load and talk to the house's recirculation-pump controller (Waveshare ESP32-S3-Relay-1CH).
+"""rcctl: build, load and talk to the hot-water recirculation-pump controller (Waveshare ESP32-S3-Relay-1CH).
 
   rcctl build              compile recirc_esp32 (writes secrets.h and version.h first)
   rcctl flash [PORT]       first load over USB-C
@@ -9,7 +9,7 @@
   rcctl status             the controller's state (JSON)
   rcctl log [BYTES]        recent output
   rcctl cmd WORDS...       a console command, e.g. "rcctl cmd phone add aa:bb:cc:dd:ee:ff rob"
-  rcctl wifi               set the Wi-Fi networks compiled into the firmware (cabin, plus an optional second)
+  rcctl wifi               set the Wi-Fi networks compiled into the firmware (the house's, plus an optional second)
 
 The controller is http://recirc (set RCCTL_HOST to override).  Its secrets live in ~/.config/recirc/, made on
 first use and compiled into the firmware; never print them:
@@ -62,7 +62,7 @@ def token(name):
 
 
 def wifi(ask=False):
-    """[(ssid, password), ...]: the cabin network first, then an optional second one (e.g. for bench testing
+    """[(ssid, password), ...]: the house's network first, then an optional second one (e.g. for bench testing
     at home).  The board joins whichever it can see."""
     path = os.path.join(CONF, "wifi")
     if ask or not os.path.exists(path):

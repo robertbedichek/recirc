@@ -1,4 +1,4 @@
-// recirc_esp32: hot-water recirculation pump controller for the house (Rob Bedichek, started 2026-11-10).
+// recirc_esp32: hot-water recirculation pump controller (Rob Bedichek, started 2026-11-10).
 //
 // Board: Waveshare ESP32-S3-Relay-1CH (ESP32-S3R8, 2.4 GHz Wi-Fi, one 10 A relay, PCF85063 RTC, isolated RS485).
 // The pump (Grundfos, 120 VAC, about 30 W) is switched by the onboard relay: line through COM/NO.
@@ -555,7 +555,7 @@ void phone_sweep(void)            // ARP every address in our /24, a few at a ti
   vSemaphoreDelete(job.done);
 }
 
-// Hue: up to four bridges (the cabin has three).  Every minute, GET /api/<key>/lights from each and fingerprint every
+// Hue: up to four bridges.  Every minute, GET /api/<key>/lights from each and fingerprint every
 // light's "on" and "bri": a changed fingerprint means someone switched or dimmed a light.  Streams the reply rather
 // than parsing it whole, since big houses send 50 KB+.
 //
@@ -1212,7 +1212,7 @@ void handle_update_done(void)
   ESP.restart();
 }
 
-// Up to two networks are compiled in (rcctl wifi): normally the cabin's, plus a second for bench testing
+// Up to two networks are compiled in (rcctl wifi): normally the house's, plus a second for bench testing
 // elsewhere.  The board joins whichever one it can see, preferring the first, and looks again when Wi-Fi has
 // been down for 3 minutes.
 struct WifiNet { const char *ssid, *pass; };
