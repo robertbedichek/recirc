@@ -41,6 +41,7 @@
 //   hue pair <ip> (press the bridge's link button first; up to 4 bridges) | hue forget [ip] | hue (list bridges)
 //   hue batteries                   battery level of each Hue dimmer, button and motion sensor, with names
 //   hue lights                      every bulb: name, maker, model, firmware, reachable
+//   hue delete-light <bridge>.<id>  remove a bulb the bridge reports unreachable (a ghost of a replaced bulb)
 //   upload on|off | update check | reboot | help
 
 #include <Arduino.h>
@@ -860,6 +861,45 @@ String hue_set_bridge(const String &ip, const String &key)    // key "" removes 
   return kept;
 }
 
+// "hue delete-light 143.19": remove a bulb from its bridge, for entries left behind by bulbs that were replaced.
+// Refuses unless the bridge says, right now, that the bulb is unreachable: a working bulb is never deleted.
+String hue_delete_light(const String &tag)
+{
+  int dot = tag.indexOf('.');
+  if (dot <= 0) return "hue delete-light <bridge>.<id>, e.g. 143.19 (from hue lights)";
+  int octet = tag.substring(0, dot).toInt();
+  String id = tag.substring(dot + 1);
+  for (unsigned i = 0; i < id.length(); i++) if (!isDigit(id[i])) return "bad light id";
+  Hue_Bridge *b = nullptr;
+  for (int i = 0; i < bridge_count; i++) if (ip_octet(bridges[i].ip) == octet) b = &bridges[i];
+  if (b == nullptr) return "no paired bridge ending in ." + String(octet);
+  String url = "http://" + b->ip + "/api/" + b->key + "/lights/" + id;
+  HTTPClient http;
+  http.setTimeout(8000);
+  if (!http.begin(url)) return "can't reach the bridge";
+  int code = http.GET();
+  String body = http.getString();
+  http.end();
+  if (code != 200 || body.indexOf("\"error\"") >= 0) return "light " + tag + " not found (" + String(code) + ")";
+  String compact = body;
+  compact.replace(" ", "");
+  if (compact.indexOf("\"reachable\":false") < 0) return "light " + tag + " is reachable: not deleting it";
+  int at = body.indexOf("\"name\"");
+  String name = at < 0 ? String("?") : body.substring(body.indexOf('"', body.indexOf(':', at)) + 1);
+  name = name.substring(0, name.indexOf('"'));
+  if (!http.begin(url)) return "can't reach the bridge";
+  code = http.sendRequest("DELETE");
+  body = http.getString();
+  http.end();
+  if (code != 200 || body.indexOf("success") < 0) return "delete failed (" + String(code) + "): " + body.substring(0, 120);
+  xSemaphoreTake(hue_mutex, portMAX_DELAY);           // Drop it from the bulb table too
+  for (int m = 0; m < hue_light_count; m++)
+    if (hue_lights_tab[m].bridge_octet == octet && id == hue_lights_tab[m].l.id) { hue_lights_tab[m] = hue_lights_tab[--hue_light_count]; break; }
+  xSemaphoreGive(hue_mutex);
+  log_event("hue light " + tag + " deleted (unreachable)");
+  return "deleted light " + tag + " (" + name + ") from the bridge at " + b->ip;
+}
+
 String hue_pair(const String &ip)
 {
   int lines = 0;
@@ -1180,6 +1220,7 @@ String run_command(String c)
     if (rest == "forget") { cfg.hue = ""; save_settings(); hue_reload = true; return "all Hue bridges forgotten"; }
     if (rest.startsWith("forget ")) { hue_set_bridge(rest.substring(7), ""); return "forgot the Hue bridge at " + rest.substring(7); }
     if (rest == "batteries") { hue_batt_pending = bridge_count > 0; return hue_batteries_text() + "(reading them again now)"; }
+    if (rest.startsWith("delete-light ")) return hue_delete_light(rest.substring(13));
     if (rest == "lights") { hue_batt_pending = bridge_count > 0; return hue_lights_text() + "(reading them again now)"; }
     return hue_bridges_text();
   }
@@ -1189,7 +1230,7 @@ String run_command(String c)
   }
   if (verb == "update") { update_check_requested = true; return "checking for new firmware"; }
   if (verb == "reboot") { stop_run("reboot"); log_event("rebooting on command"); delay(300); ESP.restart(); return ""; }
-  return "run | stop | mode auto|home|away | set ... | phone add|del ... | phones | guests [on|off] | guest ignore|unignore <mac> | hue [pair <ip>|forget [ip]|batteries|lights] | upload on|off | update check | reboot";
+  return "run | stop | mode auto|home|away | set ... | phone add|del ... | phones | guests [on|off] | guest ignore|unignore <mac> | hue [pair <ip>|forget [ip]|batteries|lights|delete-light <b.id>] | upload on|off | update check | reboot";
 }
 
 void watch_serial(void)
