@@ -36,11 +36,14 @@ Controller for a house's hot-water recirculation pump: a Waveshare
     arrived, -1 meaning never; `devices` is how many guest devices were seen within the hold time.
   - `YYYY-MM-DD HH:MM:SS arrive guest 1 present 2` when a family phone or guest device shows up after being away
     longer than the hold time. These lines carry no MAC addresses or names.
-  - `YYYY-MM-DD HH:MM:SS hue battery 143.2 87 reachable 1 model RWL022`, once after boot and then daily at 09:00,
+  - `YYYY-MM-DD HH:MM:SS hue battery 143.2 87 reachable 1 model RWL022 fw 2.45.2_hF4400CA`, once after boot and then daily at 09:00,
     for every battery-powered Hue accessory (dimmers, buttons, tap dials, motion sensors). `143.2` is the
     bridge's last address byte and the bridge's id for the accessory; `hue batteries` shows the names, which
     stay out of recirc.txt. A v2 dimmer's % runs from about 3.0 V (0%) to 3.25 V (100%), and it quits a little under 3 V.
     It also checks every hour, without logging, and alerts when an accessory that was reachable stops responding.
+  - `YYYY-MM-DD HH:MM:SS hue light 143.3 maker Signify_Netherlands_B.V. model LCA001 fw 1.122.2 reachable 1`: each
+    bulb's maker, model and firmware (spaces become `_`), at the first reading after boot and whenever one of
+    those changes. `hue lights` lists them with names.
   - `YYYY-MM-DD HH:MM:SS hue radio 143 zigbee 25 wifi 6` at the same time: each bridge's Zigbee channel and the
     2.4 GHz channel of the access point the controller is on, to check them for overlap.
   - The server's 6 AM snapshot script copies the `hue` lines into `recirc_hue.txt`, kept indefinitely, for the
@@ -94,5 +97,5 @@ the PCF85063 clock chip on I2C SDA 39, SCL 38 (address 0x51), RS485 on 17/18/21 
 
 `run`, `stop`, `mode auto|home|away`, `set interval|maxrun|rise|hold|huehold|guesthold|quiet <v>`, `phone add|del`, `phones`,
 `guests [on|off]`, `guest ignore|unignore <mac>`,
-`hue` (list bridges), `hue pair <ip>`, `hue forget [ip]`, `hue batteries`, `upload on|off`, `update check`, `reboot`. Send them over USB serial, or with
+`hue` (list bridges), `hue pair <ip>`, `hue forget [ip]`, `hue batteries`, `hue lights`, `upload on|off`, `update check`, `reboot`. Send them over USB serial, or with
 `./rcctl cmd ...` on the LAN.

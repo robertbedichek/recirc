@@ -75,6 +75,7 @@ struct Hue_Sensor {
   int battery;          // Percent, -1 if the bridge reports none
   int reachable;        // 1, 0, or -1 if not reported
   char last[20];        // state.lastupdated: the last button press or sensor event, UTC ("2026-11-18T23:20:01")
+  char fw[24];          // swversion, e.g. "2.45.2_hF4400CA"
 };
 
 struct Hue_Sensor_Scan {
@@ -99,6 +100,7 @@ struct Hue_Sensor_Scan {
       if (!strcmp(key, "name")) strncpy(s->cur.name, v, sizeof(s->cur.name) - 1);
       else if (!strcmp(key, "modelid")) strncpy(s->cur.model, v, sizeof(s->cur.model) - 1);
       else if (!strcmp(key, "type")) strncpy(s->type, v, sizeof(s->type) - 1);
+      else if (!strcmp(key, "swversion")) strncpy(s->cur.fw, v, sizeof(s->cur.fw) - 1);
     } else if (depth == 3) {                 // "config": {"on": true, "battery": 87, "reachable": true, ...}
       if (!strcmp(key, "lastupdated") && v[0] >= '0' && v[0] <= '9') strncpy(s->cur.last, v, sizeof(s->cur.last) - 1);
       else if (!strcmp(key, "battery") && v[0] >= '0' && v[0] <= '9') s->cur.battery = atoi_(v);
@@ -115,6 +117,60 @@ struct Hue_Sensor_Scan {
   static int atoi_(const char *v) { int n = 0; while (*v >= '0' && *v <= '9') n = n * 10 + (*v++ - '0'); return n; }
 
   void attach(Json_Scan &j, Hue_Sensor *table, int table_max)
+  {
+    out = table; max = table_max; count = 0;
+    j.ctx = this; j.on_open = open; j.on_value = value; j.on_close = close;
+  }
+};
+
+// Lights from GET /api/<key>/lights: who made each one, its model and firmware.
+//   {"3": {"state": {"on": true, ..., "reachable": true}, "type": "...", "name": "Kitchen 1", "modelid": "LCA001",
+//          "manufacturername": "Signify Netherlands B.V.", "productname": "Hue color lamp", "swversion": "1.122.2", ...}}
+struct Hue_Light {
+  char id[8];
+  char name[32];
+  char maker[28];
+  char model[16];
+  char product[28];
+  char fw[24];
+  int reachable;        // 1, 0, or -1 if not reported
+};
+
+struct Hue_Light_Scan {
+  Hue_Light *out;
+  int max, count = 0;
+  Hue_Light cur;
+
+  static void open(void *ctx, int depth, const char *key)
+  {
+    Hue_Light_Scan *s = (Hue_Light_Scan *)ctx;
+    if (depth != 2) return;
+    memset(&s->cur, 0, sizeof(s->cur));
+    strncpy(s->cur.id, key, sizeof(s->cur.id) - 1);
+    s->cur.reachable = -1;
+  }
+  static void value(void *ctx, int depth, const char *key, const char *v)
+  {
+    Hue_Light_Scan *s = (Hue_Light_Scan *)ctx;
+    Hue_Light &c = s->cur;
+    if (depth == 2) {
+      if (!strcmp(key, "name")) strncpy(c.name, v, sizeof(c.name) - 1);
+      else if (!strcmp(key, "modelid")) strncpy(c.model, v, sizeof(c.model) - 1);
+      else if (!strcmp(key, "manufacturername")) strncpy(c.maker, v, sizeof(c.maker) - 1);
+      else if (!strcmp(key, "productname")) strncpy(c.product, v, sizeof(c.product) - 1);
+      else if (!strcmp(key, "swversion")) strncpy(c.fw, v, sizeof(c.fw) - 1);
+    } else if (depth == 3 && !strcmp(key, "reachable")) {
+      c.reachable = !strcmp(v, "true");
+    }
+  }
+  static void close(void *ctx, int depth)
+  {
+    Hue_Light_Scan *s = (Hue_Light_Scan *)ctx;
+    if (depth != 2 || !s->cur.id[0] || s->count >= s->max) return;
+    s->out[s->count++] = s->cur;
+  }
+
+  void attach(Json_Scan &j, Hue_Light *table, int table_max)
   {
     out = table; max = table_max; count = 0;
     j.ctx = this; j.on_open = open; j.on_value = value; j.on_close = close;

@@ -40,6 +40,7 @@
 //   guests [on|off] | guest ignore|unignore <mac>   (a private-address device that is always there, e.g. an iPad)
 //   hue pair <ip> (press the bridge's link button first; up to 4 bridges) | hue forget [ip] | hue (list bridges)
 //   hue batteries                   battery level of each Hue dimmer, button and motion sensor, with names
+//   hue lights                      every bulb: name, maker, model, firmware, reachable
 //   upload on|off | update check | reboot | help
 
 #include <Arduino.h>
@@ -585,8 +586,11 @@ void phone_sweep(void)            // ARP every address in our /24, a few at a ti
 //
 // Once after boot and then daily at 09:00, read each bridge's battery-powered accessories (dimmers, buttons,
 // motion sensors) and its Zigbee channel, and log data lines:
-//   YYYY-MM-DD HH:MM:SS hue battery 143.2 87 reachable 1 model RWL021
+//   YYYY-MM-DD HH:MM:SS hue battery 143.2 87 reachable 1 model RWL021 fw 2.45.2_hF4400CA
 //   YYYY-MM-DD HH:MM:SS hue radio 143 zigbee 25 wifi 6
+//   YYYY-MM-DD HH:MM:SS hue light 143.3 maker Signify_Netherlands_B.V. model LCA001 fw 1.122.2 reachable 1
+// (a bulb's line only at the first reading after boot and when its maker, model or firmware changes; spaces in
+// values become "_").
 // 143.2 is the bridge's last address byte and the accessory's id on it; "hue batteries" shows their names, which stay
 // out of recirc.txt because it is public.  wifi is the 2.4 GHz channel of the access point this board is on.
 // Every hour it also checks them without logging, and alerts when one that was reachable becomes unreachable: the
@@ -604,6 +608,13 @@ volatile bool hue_batt_pending = true; // Read the batteries soon (after boot or
 struct Hue_Battery { Hue_Sensor s; int bridge_octet; };
 Hue_Battery hue_batts[HUE_MAX_SENSORS];
 int hue_batt_count = 0;
+
+// Bulbs, read with the batteries.  A "hue light" line goes out for each one at the first reading after boot and
+// whenever its maker, model or firmware changes, so a firmware update shows without 100+ lines a day.
+#define HUE_MAX_LIGHTS (200)
+struct Hue_Light_Entry { Hue_Light l; int bridge_octet; uint32_t logged; };
+Hue_Light_Entry hue_lights_tab[HUE_MAX_LIGHTS];
+int hue_light_count = 0;
 SemaphoreHandle_t hue_mutex;           // Guards bridges[] counts and hue_batts[] for the command handlers
 
 int ip_octet(const String &ip) { int dot = ip.lastIndexOf('.'); return dot < 0 ? 0 : ip.substring(dot + 1).toInt(); }
@@ -710,6 +721,53 @@ void hue_poll(void)
   hue_lights_on = answered ? total_on : -1;
 }
 
+static String no_spaces(const char *v) { String t = v[0] ? v : "-"; t.replace(' ', '_'); return t; }
+
+static uint32_t fnv(const char *a, uint32_t h = 2166136261u)
+{
+  for (; *a; a++) h = (h ^ (uint8_t)*a) * 16777619u;
+  return (h ^ '|') * 16777619u;
+}
+
+void hue_lights_read(Hue_Bridge &b)  // One bridge's bulbs into hue_lights_tab[]; logs new or changed ones
+{
+  static Hue_Light found[HUE_MAX_LIGHTS];
+  Json_Scan j;
+  Hue_Light_Scan ls;
+  bool saw_error = false;
+  ls.attach(j, found, HUE_MAX_LIGHTS);
+  if (!hue_get(b, "lights", j, &saw_error) || ls.count == 0) return;
+  int octet = ip_octet(b.ip);
+  for (int k = 0; k < ls.count; k++) {
+    Hue_Light &l = found[k];
+    uint32_t h = fnv(l.fw, fnv(l.model, fnv(l.maker)));
+    xSemaphoreTake(hue_mutex, portMAX_DELAY);
+    int m = 0;
+    while (m < hue_light_count && !(hue_lights_tab[m].bridge_octet == octet && !strcmp(hue_lights_tab[m].l.id, l.id))) m++;
+    bool fresh = m == hue_light_count;
+    if (fresh && hue_light_count < HUE_MAX_LIGHTS) { hue_light_count++; hue_lights_tab[m].logged = 0; }
+    bool log_it = m < HUE_MAX_LIGHTS && (fresh || hue_lights_tab[m].logged != h);
+    if (m < HUE_MAX_LIGHTS) { hue_lights_tab[m].l = l; hue_lights_tab[m].bridge_octet = octet; hue_lights_tab[m].logged = h; }
+    xSemaphoreGive(hue_mutex);
+    if (log_it)
+      out.println(timestamp() + " hue light " + String(octet) + "." + l.id + " maker " + no_spaces(l.maker) +
+                  " model " + no_spaces(l.model) + " fw " + no_spaces(l.fw) + " reachable " + String(l.reachable));
+  }
+}
+
+String hue_lights_text(void)         // For the "hue lights" command: includes names
+{
+  String r;
+  xSemaphoreTake(hue_mutex, portMAX_DELAY);
+  for (int i = 0; i < hue_light_count; i++) {
+    Hue_Light &l = hue_lights_tab[i].l;
+    r += String(hue_lights_tab[i].bridge_octet) + "." + l.id + "\t" + l.name + "\t" + l.maker + "\t" + l.model + "\t" +
+         l.product + "\t" + l.fw + "\t" + (l.reachable == 0 ? "unreachable" : "ok") + "\n";
+  }
+  xSemaphoreGive(hue_mutex);
+  return r.length() ? r : String("no bulbs read yet\n");
+}
+
 void hue_battery_read(bool log_lines)   // log_lines: the daily data lines; false for the hourly reachability check
 {
   if (WiFi.status() != WL_CONNECTED || !time_valid) return;
@@ -743,13 +801,14 @@ void hue_battery_read(bool log_lines)   // log_lines: the daily data lines; fals
       String tag = String(h.bridge_octet) + "." + h.s.id;
       if (log_lines)
         out.println(timestamp() + " hue battery " + tag + " " + String(h.s.battery) + " reachable " + String(h.s.reachable) +
-                    " model " + (h.s.model[0] ? h.s.model : "-"));
+                    " model " + (h.s.model[0] ? h.s.model : "-") + " fw " + (h.s.fw[0] ? h.s.fw : "-"));
       // Only a change seen since boot alerts, so reboots don't repeat alerts for accessories long gone.
       if (was == 1 && h.s.reachable == 0)
         log_event("alert Hue " + String(h.s.model) + " " + tag + " stopped responding (\"hue batteries\" names it)");
       else if (was == 0 && h.s.reachable == 1)
         log_event("Hue " + String(h.s.model) + " " + tag + " is responding again");
     }
+    if (log_lines) hue_lights_read(b);
   }
   xSemaphoreTake(hue_mutex, portMAX_DELAY);
   memcpy(hue_batts, fresh, sizeof(Hue_Battery) * n);
@@ -1121,6 +1180,7 @@ String run_command(String c)
     if (rest == "forget") { cfg.hue = ""; save_settings(); hue_reload = true; return "all Hue bridges forgotten"; }
     if (rest.startsWith("forget ")) { hue_set_bridge(rest.substring(7), ""); return "forgot the Hue bridge at " + rest.substring(7); }
     if (rest == "batteries") { hue_batt_pending = bridge_count > 0; return hue_batteries_text() + "(reading them again now)"; }
+    if (rest == "lights") { hue_batt_pending = bridge_count > 0; return hue_lights_text() + "(reading them again now)"; }
     return hue_bridges_text();
   }
   if (verb == "upload") {
@@ -1129,7 +1189,7 @@ String run_command(String c)
   }
   if (verb == "update") { update_check_requested = true; return "checking for new firmware"; }
   if (verb == "reboot") { stop_run("reboot"); log_event("rebooting on command"); delay(300); ESP.restart(); return ""; }
-  return "run | stop | mode auto|home|away | set ... | phone add|del ... | phones | guests [on|off] | guest ignore|unignore <mac> | hue [pair <ip>|forget [ip]|batteries] | upload on|off | update check | reboot";
+  return "run | stop | mode auto|home|away | set ... | phone add|del ... | phones | guests [on|off] | guest ignore|unignore <mac> | hue [pair <ip>|forget [ip]|batteries|lights] | upload on|off | update check | reboot";
 }
 
 void watch_serial(void)
