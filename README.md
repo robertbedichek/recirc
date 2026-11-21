@@ -11,16 +11,19 @@ Controller for a house's hot-water recirculation pump: a Waveshare
 - It runs only when someone is home, and never from 11 PM to 7 AM.
 - The run-now button runs it at any time.
 - It never runs without a working return-line temperature.
-- **Someone is home** when one of these happened within the last 60 minutes:
-  - A family phone was seen on the house Wi-Fi. Every 2 minutes it sweeps the local /24 for their MAC
-    addresses using ARP, the network's address lookup.
-  - Any other device with a private (randomized) Wi-Fi address was seen in the same sweep. Phones, including
-    guests', join with private addresses, while routers, Hue bridges, cameras and computers left on use their
-    real ones, so this counts visitors without registering them. `guests off` turns it off; `guest ignore <mac>`
-    excludes a private-address device that is always there (an iPad left at the house, say). `guests` lists
-    what it has seen.
-  - A Hue light was switched or dimmed. It polls each paired bridge's local API every minute (up to four
-    bridges).
+- **Someone is home** when one of these holds:
+  - A family phone was seen on the house Wi-Fi within the last 60 minutes (`hold`). Every 2 minutes it sweeps
+    the local /24 for their MAC addresses using ARP, the network's address lookup.
+  - A Hue light was switched or dimmed within the last 2 hours (`huehold`). It polls each paired bridge's local
+    API every minute (up to four bridges). Brightness changes on lights that are off, and polls where the number
+    of lights differs (a short read), don't count.
+  - A guest device arrived within the last 2 hours (`guesthold`): any other device with a private (randomized)
+    Wi-Fi address, seen in the same sweep after being gone 60 minutes or more. Phones, including guests', join
+    with private addresses, while routers, Hue bridges, cameras and computers left on use their real ones, so
+    this counts visitors without registering them. It counts arrivals rather than presence because a house
+    collects private-address devices that never leave; devices seen in the first 10 minutes after boot were
+    already there. `guests off` turns it off; `guest ignore <mac>` drops a device entirely. `guests` lists what
+    it has seen.
 
   With all of these off it assumes someone is home. `mode home` and `mode away` override this.
 - **Time** comes from NTP and is kept across outages by the onboard PCF85063 clock chip, which holds UTC.
@@ -28,9 +31,9 @@ Controller for a house's hot-water recirculation pump: a Waveshare
 - **Telemetry** is posted to `https://bedichek.org/home/api/ingest/recirc`, appending to
   `recirc.txt` in a private, unlisted folder on the server (its path is set in the ingest service, not here). Lines containing "alert" go to Pushover, as for the solar controllers.
   - `YYYY-MM-DD HH:MM:SS run schedule warm secs 34 start 61.2 end 65.4 peak 65.6`
-  - `YYYY-MM-DD HH:MM:SS status T 64.2 home 1 phone 12 guest 3 devices 2 hue 45 lights 3/41 runs 14 secs 410 rssi -62`,
-    every 5 minutes. `phone`, `guest` and `hue` are minutes since last seen, -1 meaning never; `devices` is how
-    many guest devices were seen within the hold time.
+  - `YYYY-MM-DD HH:MM:SS status T 64.2 home 1 phone 12 guest 3 arrive 40 devices 2 hue 45 lights 3/41 runs 14 secs 410 rssi -62`,
+    every 5 minutes. `phone`, `guest` and `hue` are minutes since last seen, `arrive` minutes since a guest device
+    arrived, -1 meaning never; `devices` is how many guest devices were seen within the hold time.
   - `YYYY-MM-DD HH:MM:SS arrive guest 1 present 2` when a family phone or guest device shows up after being away
     longer than the hold time. These lines carry no MAC addresses or names.
   - `YYYY-MM-DD HH:MM:SS hue battery 143.2 87 reachable 1 model RWL022`, once after boot and then daily at 09:00,
@@ -89,7 +92,7 @@ the PCF85063 clock chip on I2C SDA 39, SCL 38 (address 0x51), RS485 on 17/18/21 
 
 ## Commands
 
-`run`, `stop`, `mode auto|home|away`, `set interval|maxrun|rise|hold|quiet <v>`, `phone add|del`, `phones`,
+`run`, `stop`, `mode auto|home|away`, `set interval|maxrun|rise|hold|huehold|guesthold|quiet <v>`, `phone add|del`, `phones`,
 `guests [on|off]`, `guest ignore|unignore <mac>`,
 `hue` (list bridges), `hue pair <ip>`, `hue forget [ip]`, `hue batteries`, `upload on|off`, `update check`, `reboot`. Send them over USB serial, or with
 `./rcctl cmd ...` on the LAN.

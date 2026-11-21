@@ -9,10 +9,14 @@
 //   max_run_s seconds, whichever comes first.  The "run now" button (IO2) runs it regardless of presence or the
 //   hour.  The pump never runs without a working return-line temperature.
 //
-//   Someone is home when, within the last hold_min minutes, a family phone has been seen on the Wi-Fi (ARP sweep
-//   of the local /24 for their MACs), any other device with a private (randomized) Wi-Fi address has been seen
-//   ("guests", on by default: visitors' phones; fixed gear uses real MACs), or a Hue light has changed (polled
-//   from the bridge's local API).  With all of these off it assumes someone is home.  "mode home|away" overrides.
+//   Someone is home when any of these holds:
+//   - a family phone has been seen on the Wi-Fi within hold_min (60) minutes (ARP sweep of the local /24 for their MACs);
+//   - a Hue light was switched or dimmed within hue_hold_min (120) minutes (polled from the bridges' local API);
+//   - a guest device arrived within guest_hold_min (120) minutes ("guests", on by default): any other device with a
+//     private (randomized) Wi-Fi address, as visitors' phones use, that had been gone for hold_min minutes or more.
+//     Arrival, not presence, because a house collects devices that never leave (an iPad, a TV); fixed gear uses
+//     real MACs and never counts.  Devices seen in the first 10 minutes after boot were already there.
+//   With all of these off it assumes someone is home.  "mode home|away" overrides.
 //
 // Hardware:
 //   IO47  relay (high = closed = pump on)
@@ -31,7 +35,7 @@
 // Console commands (USB serial, or POST /cmd):
 //   run | stop                      run the pump now (subject to max_run_s) | stop it
 //   mode auto|home|away             presence from phones and Hue | always home | never on schedule
-//   set interval|maxrun|rise|hold|quiet <value>   (quiet takes "23-7"; "set" alone lists them)
+//   set interval|maxrun|rise|hold|huehold|guesthold|quiet <value>   (quiet takes "23-7"; "set" alone lists them)
 //   phone add <mac> <name> | phone del <mac> | phones
 //   guests [on|off] | guest ignore|unignore <mac>   (a private-address device that is always there, e.g. an iPad)
 //   hue pair <ip> (press the bridge's link button first; up to 4 bridges) | hue forget [ip] | hue (list bridges)
@@ -80,7 +84,10 @@ struct Settings {
   int interval_min = 20;      // Minutes between scheduled runs, aligned to the hour
   int max_run_s = 80;         // Longest a run may last
   float rise_F = 4.0;         // Stop once the return line is this much warmer than at the start
-  int hold_min = 60;          // Someone is home for this long after a phone or Hue light was last seen
+  int hold_min = 60;          // Someone is home for this long after a family phone was last seen; also how long a
+                              // guest device must be gone before its return counts as an arrival
+  int hue_hold_min = 120;     // ... for this long after a Hue light was switched or dimmed
+  int guest_hold_min = 120;   // ... for this long after a guest device arrived
   int quiet_start_h = 23;     // No scheduled runs from quiet_start_h:00 ...
   int quiet_end_h = 7;        // ... to quiet_end_h:00, local time
   char mode = 'a';            // 'a' auto (presence), 'h' always home, 'w' away (no scheduled runs)
@@ -100,6 +107,8 @@ void save_settings(void)
   prefs.putInt("maxrun", cfg.max_run_s);
   prefs.putFloat("rise", cfg.rise_F);
   prefs.putInt("hold", cfg.hold_min);
+  prefs.putInt("huehold", cfg.hue_hold_min);
+  prefs.putInt("guesthold", cfg.guest_hold_min);
   prefs.putInt("qstart", cfg.quiet_start_h);
   prefs.putInt("qend", cfg.quiet_end_h);
   prefs.putChar("mode", cfg.mode);
@@ -120,6 +129,8 @@ void load_settings(void)
   cfg.max_run_s = prefs.getInt("maxrun", cfg.max_run_s);
   cfg.rise_F = prefs.getFloat("rise", cfg.rise_F);
   cfg.hold_min = prefs.getInt("hold", cfg.hold_min);
+  cfg.hue_hold_min = prefs.getInt("huehold", cfg.hue_hold_min);
+  cfg.guest_hold_min = prefs.getInt("guesthold", cfg.guest_hold_min);
   cfg.quiet_start_h = prefs.getInt("qstart", cfg.quiet_start_h);
   cfg.quiet_end_h = prefs.getInt("qend", cfg.quiet_end_h);
   cfg.mode = prefs.getChar("mode", cfg.mode);
@@ -369,6 +380,8 @@ int guest_count = 0;
 uint8_t ignored[16][6];
 int ignored_count = 0;
 int arrivals_phone = 0, arrivals_guest = 0;  // Counted in lwIP's thread (presence_mutex held), logged by the presence task
+unsigned long guest_arrival_ms = 0;   // millis() a guest device last arrived, 0 if none since boot
+#define BOOT_GRACE_MS (10 * 60000UL)  // Guest devices first seen this soon after boot were already there
 
 bool parse_mac(const String &s, uint8_t mac[6])
 {
@@ -452,6 +465,14 @@ int guests_present(void)             // Guest devices seen within the hold time
   return n;
 }
 
+unsigned long last_guest_arrival_ms(void)
+{
+  xSemaphoreTake(presence_mutex, portMAX_DELAY);
+  unsigned long t = guest_arrival_ms;
+  xSemaphoreGive(presence_mutex);
+  return t;
+}
+
 unsigned long last_phone_ms(void)     // millis() a family phone was last seen, 0 if never
 {
   unsigned long best = 0;
@@ -471,8 +492,8 @@ bool someone_home(void)
   if (cfg.mode == 'w') return false;
   bool have_phones = phone_count > 0, have_hue = cfg.hue.length() > 0;
   if (!have_phones && !have_hue && !cfg.guests) return true;   // Nothing to go on: assume yes
-  return recent(last_phone_ms(), cfg.hold_min) || recent(hue_change_ms, cfg.hold_min) ||
-         (cfg.guests && recent(last_guest_ms(), cfg.hold_min));
+  return recent(last_phone_ms(), cfg.hold_min) || recent(hue_change_ms, cfg.hue_hold_min) ||
+         (cfg.guests && recent(last_guest_arrival_ms(), cfg.guest_hold_min));
 }
 
 // lwIP's raw ARP calls must run in its own thread
@@ -525,7 +546,10 @@ static void arp_scan_table(void *arg)
       memcpy(guests[g].mac, eth->addr, 6);
       guests[g].seen_ms = 0;
     }
-    if (guests[g].seen_ms == 0 || now - guests[g].seen_ms >= hold) arrivals_guest++;
+    if (guests[g].seen_ms == 0 || now - guests[g].seen_ms >= hold) {
+      arrivals_guest++;
+      if (now >= BOOT_GRACE_MS) guest_arrival_ms = now;
+    }
     guests[g].seen_ms = now;
     guests[g].ip = ip->addr;
   }
@@ -634,17 +658,20 @@ bool hue_get(Hue_Bridge &b, const char *what, Json_Scan &j, bool *saw_error)
   return true;
 }
 
-// Fingerprint of the lights: FNV-1a over every "on" and "bri" value.
+// Fingerprint of the lights: FNV-1a over every "on" value, and "bri" of lights that are on (a light that is off can
+// report a new brightness with nobody touching it).  The bridge sends "on" before "bri" in each state.
 struct Light_Scan {
   uint32_t h = 2166136261u;
   int lights = 0, on = 0;
+  bool last_on = false;
   static void value(void *ctx, int depth, const char *key, const char *v)
   {
     Light_Scan *l = (Light_Scan *)ctx;
     if (depth != 3) return;                   // {"1": {"state": {"on": true, "bri": 254, ...}, ...}, ...}
     bool is_on = !strcmp(key, "on");
     if (!is_on && strcmp(key, "bri")) return;
-    if (is_on) { l->lights++; if (!strcmp(v, "true")) l->on++; }
+    if (is_on) { l->lights++; l->last_on = !strcmp(v, "true"); if (l->last_on) l->on++; }
+    else if (!l->last_on) return;
     for (const char *p = v; *p; p++) l->h = (l->h ^ (uint8_t)*p) * 16777619u;
     l->h = (l->h ^ '|') * 16777619u;
   }
@@ -666,7 +693,8 @@ void hue_poll(void)
       continue;
     }
     b.error_reported = false;
-    if (b.have_fingerprint && l.h != b.fingerprint) {
+    // A different light count is a short read or a light added or removed, not someone at a switch.
+    if (b.have_fingerprint && l.lights == b.lights && l.h != b.fingerprint) {
       hue_change_ms = millis();
       log_event("hue change at " + b.ip + ": " + String(l.on) + " of " + String(l.lights) + " lights on");
     }
@@ -949,8 +977,9 @@ void watch_button(void)           // Called every 100 ms; a press of 0.2 s or mo
 
 // ---------------------------------------------------------------------------------------------------------------
 // Periodic status line, every 5 minutes:
-//   YYYY-MM-DD HH:MM:SS status T 64.2 home 1 phone 12 guest 3 devices 2 hue 45 lights 3/41 runs 14 secs 410 rssi -62
-// phone, guest and hue are minutes since last seen (-1 never); devices is guest devices seen within the hold time;
+//   YYYY-MM-DD HH:MM:SS status T 64.2 home 1 phone 12 guest 3 arrive 40 devices 2 hue 45 lights 3/41 runs 14 secs 410 rssi -62
+// phone, guest and hue are minutes since last seen (-1 never); arrive is minutes since a guest device arrived;
+// devices is guest devices seen within the hold time;
 // T is "-" without a probe reading.
 
 String minutes_since(unsigned long ms) { return ms == 0 ? String("-1") : String((millis() - ms) / 60000UL); }
@@ -962,6 +991,7 @@ void status_line(void)
   if (probe_ok()) snprintf(t, sizeof(t), "%.1f", return_F); else strcpy(t, "-");
   out.println(timestamp() + " status T " + t + " home " + (someone_home() ? "1" : "0") +
               " phone " + minutes_since(last_phone_ms()) + " guest " + minutes_since(last_guest_ms()) +
+              " arrive " + minutes_since(last_guest_arrival_ms()) +
               " devices " + String(guests_present()) + " hue " + minutes_since(hue_change_ms) +
               " lights " + String(hue_lights_on) + "/" + String(hue_lights) +
               " runs " + String(runs_today) + " secs " + String(run_seconds_today) + " rssi " + String(WiFi.RSSI()));
@@ -972,9 +1002,11 @@ void status_line(void)
 
 String settings_text(void)
 {
-  char b[220];
-  snprintf(b, sizeof(b), "interval %d min, maxrun %d s, rise %.1f F, hold %d min, quiet %d-%d, mode %s, guests %s, upload %s",
-           cfg.interval_min, cfg.max_run_s, cfg.rise_F, cfg.hold_min, cfg.quiet_start_h, cfg.quiet_end_h,
+  char b[260];
+  snprintf(b, sizeof(b), "interval %d min, maxrun %d s, rise %.1f F, hold %d min, huehold %d min, guesthold %d min, "
+           "quiet %d-%d, mode %s, guests %s, upload %s",
+           cfg.interval_min, cfg.max_run_s, cfg.rise_F, cfg.hold_min, cfg.hue_hold_min, cfg.guest_hold_min,
+           cfg.quiet_start_h, cfg.quiet_end_h,
            cfg.mode == 'h' ? "home" : cfg.mode == 'w' ? "away" : "auto", cfg.guests ? "on" : "off", cfg.upload ? "on" : "off");
   return String(b);
 }
@@ -1007,11 +1039,13 @@ String run_command(String c)
     else if (what == "maxrun" && v.toInt() >= 10 && v.toInt() <= 600) cfg.max_run_s = v.toInt();
     else if (what == "rise" && v.toFloat() >= 1 && v.toFloat() <= 30) cfg.rise_F = v.toFloat();
     else if (what == "hold" && v.toInt() >= 5 && v.toInt() <= 24 * 60) cfg.hold_min = v.toInt();
+    else if (what == "huehold" && v.toInt() >= 5 && v.toInt() <= 24 * 60) cfg.hue_hold_min = v.toInt();
+    else if (what == "guesthold" && v.toInt() >= 5 && v.toInt() <= 24 * 60) cfg.guest_hold_min = v.toInt();
     else if (what == "quiet" && v.indexOf('-') > 0) {
       int a = v.substring(0, v.indexOf('-')).toInt(), b = v.substring(v.indexOf('-') + 1).toInt();
       if (a < 0 || a > 23 || b < 0 || b > 23) return "quiet takes hours 0-23, like 23-7";
       cfg.quiet_start_h = a; cfg.quiet_end_h = b;
-    } else return "set interval 5-240 | maxrun 10-600 | rise 1-30 | hold 5-1440 | quiet H-H";
+    } else return "set interval 5-240 | maxrun 10-600 | rise 1-30 | hold|huehold|guesthold 5-1440 | quiet H-H";
     save_settings();
     log_event("set " + rest);
     return settings_text();
@@ -1144,6 +1178,7 @@ void handle_status(void)
   s += "  \"someone_home\": " + String(someone_home() ? "true" : "false") + ",\n";
   s += "  \"phone_min_ago\": " + minutes_since(last_phone_ms()) + ",\n";
   s += "  \"guest_min_ago\": " + minutes_since(last_guest_ms()) + ",\n";
+  s += "  \"guest_arrival_min_ago\": " + minutes_since(last_guest_arrival_ms()) + ",\n";
   s += "  \"guest_devices\": " + String(guests_present()) + ",\n";
   s += "  \"hue_change_min_ago\": " + minutes_since(hue_change_ms) + ",\n";
   s += "  \"hue_lights_on\": " + String(hue_lights_on) + ",\n";
