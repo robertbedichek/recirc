@@ -102,5 +102,5 @@ the PCF85063 clock chip on I2C SDA 39, SCL 38 (address 0x51), RS485 on 17/18/21 
 
 `run`, `stop`, `mode auto|home|away`, `set interval|maxrun|rise|hold|huehold|guesthold|quiet <v>`, `phone add|del`, `phones`,
 `guests [on|off]`, `guest ignore|unignore <mac>`,
-`hue` (list bridges), `hue pair <ip>`, `hue forget [ip]`, `hue batteries`, `hue lights`, `hue delete-light <bridge>.<id>` (only an unreachable bulb), `upload on|off`, `update check`, `reboot`. Send them over USB serial, or with
+`hue` (list bridges), `hue pair <ip>`, `hue forget [ip]`, `hue batteries`, `hue lights`, `hue delete-light <bridge>.<id>` (only an unreachable bulb), `hue delete-sensor <bridge>.<id>` (only an unreachable switch or sensor), `upload on|off`, `update check`, `reboot`. Send them over USB serial, or with
 `./rcctl cmd ...` on the LAN.
