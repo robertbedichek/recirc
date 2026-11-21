@@ -43,6 +43,7 @@
 //   hue lights                      every bulb: name, maker, model, firmware, reachable
 //   hue delete-light <bridge>.<id>  remove a bulb the bridge reports unreachable (a ghost of a replaced bulb)
 //   hue delete-sensor <bridge>.<id> the same for a switch or sensor (ids from hue batteries)
+//   hue rooms                       rooms and zones with their bulbs, and the rooms each switch acts on
 //   upload on|off | update check | reboot | help
 
 #include <Arduino.h>
@@ -884,6 +885,55 @@ String hue_set_bridge(const String &ip, const String &key)    // key "" removes 
   return kept;
 }
 
+// "hue rooms": each bridge's rooms and zones with their bulbs, and the rooms each switch or sensor acts on (from the
+// bridge's rules), for the private page's room column.  Names stay out of recirc.txt: this only answers the command.
+//   room 145.1 Room Kitchen<TAB>5,6,7
+//   switch 145.10 -> 1,4
+struct Rooms_Out { String *r; int octet; };
+static void rooms_group(void *user, const char *id, const char *name, const char *type, const char *lights)
+{
+  Rooms_Out *o = (Rooms_Out *)user;
+  *o->r += "room " + String(o->octet) + "." + id + " " + type + " " + name + "\t" + lights + "\n";
+}
+struct Rule_Pairs { char s[8], g[8]; };
+static Rule_Pairs rule_pairs[400];
+static int rule_pair_count;
+static void rooms_pair(void *user, const char *sensor, const char *group)
+{
+  for (int i = 0; i < rule_pair_count; i++)
+    if (!strcmp(rule_pairs[i].s, sensor) && !strcmp(rule_pairs[i].g, group)) return;
+  if (rule_pair_count >= 400) return;
+  strncpy(rule_pairs[rule_pair_count].s, sensor, 7); rule_pairs[rule_pair_count].s[7] = 0;
+  strncpy(rule_pairs[rule_pair_count].g, group, 7); rule_pairs[rule_pair_count].g[7] = 0;
+  rule_pair_count++;
+}
+String hue_rooms_text(void)
+{
+  String r;
+  for (int i = 0; i < bridge_count; i++) {
+    Hue_Bridge &b = bridges[i];
+    bool saw_error = false;
+    Rooms_Out o = { &r, ip_octet(b.ip) };
+    { Json_Scan j; Hue_Group_Scan g; g.on_group = rooms_group; g.user = &o; g.attach(j);
+      if (!hue_get(b, "groups", j, &saw_error)) r += "bridge " + String(o.octet) + ": no answer for groups\n"; }
+    rule_pair_count = 0;
+    { Json_Scan j; Hue_Rule_Scan rs; rs.on_pair = rooms_pair; rs.attach(j);
+      if (!hue_get(b, "rules", j, &saw_error)) r += "bridge " + String(o.octet) + ": no answer for rules\n"; }
+    // One line per switch: its groups, in the order first seen.
+    for (int k = 0; k < rule_pair_count; k++) {
+      bool first = true;
+      for (int m = 0; m < k; m++) if (!strcmp(rule_pairs[m].s, rule_pairs[k].s)) first = false;
+      if (!first) continue;
+      String line = "switch " + String(o.octet) + "." + rule_pairs[k].s + " -> ";
+      bool any = false;
+      for (int m = k; m < rule_pair_count; m++)
+        if (!strcmp(rule_pairs[m].s, rule_pairs[k].s)) { line += (any ? "," : "") + String(rule_pairs[m].g); any = true; }
+      r += line + "\n";
+    }
+  }
+  return r.length() ? r : String("no bridges paired\n");
+}
+
 // "hue delete-light 143.19" / "hue delete-sensor 145.45": remove a bulb, or a switch or sensor, from its bridge, for
 // entries left behind by devices that were replaced or taken away.  Refuses unless the bridge says, right now, that
 // the device is unreachable: a working one is never deleted.
@@ -1252,6 +1302,7 @@ String run_command(String c)
     if (rest == "batteries") { hue_batt_pending = bridge_count > 0; return hue_batteries_text() + "(reading them again now)"; }
     if (rest.startsWith("delete-light ")) return hue_delete(rest.substring(13), false);
     if (rest.startsWith("delete-sensor ")) return hue_delete(rest.substring(14), true);
+    if (rest == "rooms") return hue_rooms_text();
     if (rest == "lights") { hue_batt_pending = bridge_count > 0; return hue_lights_text() + "(reading them again now)"; }
     return hue_bridges_text();
   }
@@ -1261,7 +1312,7 @@ String run_command(String c)
   }
   if (verb == "update") { update_check_requested = true; return "checking for new firmware"; }
   if (verb == "reboot") { stop_run("reboot"); log_event("rebooting on command"); delay(300); ESP.restart(); return ""; }
-  return "run | stop | mode auto|home|away | set ... | phone add|del ... | phones | guests [on|off] | guest ignore|unignore <mac> | hue [pair <ip>|forget [ip]|batteries|lights|delete-light <b.id>|delete-sensor <b.id>] | upload on|off | update check | reboot";
+  return "run | stop | mode auto|home|away | set ... | phone add|del ... | phones | guests [on|off] | guest ignore|unignore <mac> | hue [pair <ip>|forget [ip]|batteries|lights|rooms|delete-light <b.id>|delete-sensor <b.id>] | upload on|off | update check | reboot";
 }
 
 void watch_serial(void)

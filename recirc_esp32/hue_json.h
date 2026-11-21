@@ -5,12 +5,14 @@
 // Depth counts the open objects/arrays: the reply's outer object is depth 1.  Callbacks:
 //   on_open(ctx, depth, key)          an object or array opened; depth is its own depth, key its name ("" in arrays)
 //   on_value(ctx, depth, key, value)  a scalar inside the container at depth; strings come unquoted, others as
-//                                     written (87, true, null)
+//                                     written (87, true, null).  An array's elements come with the array's own
+//                                     name as key ("lights": ["1", "2"] gives key "lights" twice)
 //   on_close(ctx, depth)              the container at depth closed
 // Keys and values longer than 47 characters are cut short.
 
 #pragma once
 #include <string.h>
+#include <stdint.h>
 
 struct Json_Scan {
   void *ctx = nullptr;
@@ -20,7 +22,11 @@ struct Json_Scan {
 
   int depth = 0;
   bool in_str = false, esc = false, want_value = false, have_scalar = false;
-  char key[48] = "", tok[48] = "";
+  char key[48] = "", tok[48] = "", akey[48] = "";   // akey: the name of the innermost open array
+  uint32_t arrays = 0;                               // bit d set: the container at depth d is an array
+
+  bool in_array(void) const { return depth > 0 && depth < 32 && (arrays >> depth & 1); }
+  void emit_elem(void) { if (on_value) on_value(ctx, depth, akey, tok); }
   int tok_len = 0;
 
   void reset_tok(void) { tok_len = 0; tok[0] = 0; }
@@ -35,6 +41,7 @@ struct Json_Scan {
       else if (c == '"') {
         in_str = false;
         if (want_value) { emit(); want_value = false; }
+        else if (in_array()) emit_elem();
         else { memcpy(key, tok, sizeof(key)); }
       }
       else add(c);
@@ -45,22 +52,27 @@ struct Json_Scan {
     case ':': want_value = true; have_scalar = false; reset_tok(); return;
     case '{': case '[':
       depth++;
+      if (depth < 32) { if (c == '[') arrays |= 1u << depth; else arrays &= ~(1u << depth); }
+      if (c == '[') memcpy(akey, want_value ? key : "", sizeof(akey));
       if (on_open) on_open(ctx, depth, want_value ? key : "");
       want_value = false; key[0] = 0; reset_tok();
       return;
     case '}': case ']':
       if (want_value && have_scalar) emit();
+      else if (in_array() && have_scalar) emit_elem();
+      have_scalar = false;
       want_value = false;
       if (on_close) on_close(ctx, depth);
       depth--; reset_tok();
       return;
     case ',':
       if (want_value && have_scalar) emit();
-      want_value = false; reset_tok();
+      else if (in_array() && have_scalar) emit_elem();
+      want_value = false; have_scalar = false; reset_tok();
       return;
     case ' ': case '\n': case '\r': case '\t': return;
     default:
-      if (want_value) { add(c); have_scalar = true; }
+      if (want_value || in_array()) { add(c); have_scalar = true; }
       return;
     }
   }
@@ -175,6 +187,82 @@ struct Hue_Light_Scan {
     out = table; max = table_max; count = 0;
     j.ctx = this; j.on_open = open; j.on_value = value; j.on_close = close;
   }
+};
+
+// Rooms and zones from GET /api/<key>/groups:
+//   {"5": {"name": "Kitchen", "lights": ["5", "6"], "type": "Room", "class": "Kitchen", ...}, ...}
+// Calls back once per Room or Zone with its id, name, type and its lights as "5,6,7".
+struct Hue_Group_Scan {
+  void (*on_group)(void *user, const char *id, const char *name, const char *type, const char *lights) = nullptr;
+  void *user = nullptr;
+  char id[8], name[48], type[16], lights[400];
+  static void open(void *ctx, int depth, const char *key)
+  {
+    Hue_Group_Scan *g = (Hue_Group_Scan *)ctx;
+    if (depth != 2) return;
+    strncpy(g->id, key, sizeof(g->id) - 1); g->id[sizeof(g->id) - 1] = 0;
+    g->name[0] = g->type[0] = g->lights[0] = 0;
+  }
+  static void value(void *ctx, int depth, const char *key, const char *v)
+  {
+    Hue_Group_Scan *g = (Hue_Group_Scan *)ctx;
+    if (depth == 2 && !strcmp(key, "name")) { strncpy(g->name, v, sizeof(g->name) - 1); g->name[sizeof(g->name) - 1] = 0; }
+    else if (depth == 2 && !strcmp(key, "type")) { strncpy(g->type, v, sizeof(g->type) - 1); g->type[sizeof(g->type) - 1] = 0; }
+    else if (depth == 3 && !strcmp(key, "lights")) {
+      size_t n = strlen(g->lights);
+      if (n + strlen(v) + 2 < sizeof(g->lights)) { if (n) g->lights[n++] = ','; strcpy(g->lights + n, v); }
+    }
+  }
+  static void close(void *ctx, int depth)
+  {
+    Hue_Group_Scan *g = (Hue_Group_Scan *)ctx;
+    if (depth != 2 || !g->on_group) return;
+    if (!strcmp(g->type, "Room") || !strcmp(g->type, "Zone")) g->on_group(g->user, g->id, g->name, g->type, g->lights);
+  }
+  void attach(Json_Scan &j) { j.ctx = this; j.on_open = open; j.on_value = value; j.on_close = close; }
+};
+
+// Which groups each switch or sensor acts on, from GET /api/<key>/rules:
+//   {"1": {"conditions": [{"address": "/sensors/2/state/buttonevent", ...}], "actions": [{"address": "/groups/5/action", ...}]}}
+// Calls back once per rule for every (sensor, group) pair in it.  Switches set up by newer Hue apps may have no
+// rules here (they live in the bridge's newer interface), so a switch can come out with no group.
+struct Hue_Rule_Scan {
+  void (*on_pair)(void *user, const char *sensor, const char *group) = nullptr;
+  void *user = nullptr;
+  char sensors[4][8], groups[6][8];
+  int ns = 0, ng = 0;
+  static void take(const char *v, const char *prefix, char (*tab)[8], int &n, int max)
+  {
+    size_t pl = strlen(prefix);
+    if (strncmp(v, prefix, pl) || n >= max) return;
+    int k = 0;
+    while (v[pl + k] >= '0' && v[pl + k] <= '9' && k < 7) { tab[n][k] = v[pl + k]; k++; }
+    tab[n][k] = 0;
+    if (!k) return;
+    for (int i = 0; i < n; i++) if (!strcmp(tab[i], tab[n])) return;
+    n++;
+  }
+  bool in_conditions = false;               // inside "conditions" (else "actions")
+  static void open(void *ctx, int depth, const char *key)
+  {
+    Hue_Rule_Scan *r = (Hue_Rule_Scan *)ctx;
+    if (depth == 2) r->ns = r->ng = 0;
+    else if (depth == 3) r->in_conditions = !strcmp(key, "conditions");
+  }
+  static void value(void *ctx, int depth, const char *key, const char *v)
+  {
+    Hue_Rule_Scan *r = (Hue_Rule_Scan *)ctx;
+    if (depth != 4 || strcmp(key, "address")) return;
+    if (r->in_conditions) take(v, "/sensors/", r->sensors, r->ns, 4);   // the switch or sensor that triggers it
+    else take(v, "/groups/", r->groups, r->ng, 6);                     // the rooms it acts on
+  }
+  static void close(void *ctx, int depth)
+  {
+    Hue_Rule_Scan *r = (Hue_Rule_Scan *)ctx;
+    if (depth != 2 || !r->on_pair) return;
+    for (int i = 0; i < r->ns; i++) for (int k = 0; k < r->ng; k++) r->on_pair(r->user, r->sensors[i], r->groups[k]);
+  }
+  void attach(Json_Scan &j) { j.ctx = this; j.on_open = open; j.on_value = value; j.on_close = close; }
 };
 
 // From GET /api/<key>/config: the Zigbee channel, and the bridge's own firmware and update settings:
