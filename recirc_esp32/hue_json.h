@@ -177,14 +177,43 @@ struct Hue_Light_Scan {
   }
 };
 
-// "zigbeechannel" from GET /api/<key>/config.
+// From GET /api/<key>/config: the Zigbee channel, and the bridge's own firmware and update settings:
+//   "modelid", "swversion", "apiversion", "swupdate2": {"state", "bridge": {"lastinstall"}, "autoinstall": {"on"}}
 struct Hue_Config_Scan {
   int zigbee_channel = -1;
+  int autoinstall = -1;                    // 1 = automatic updates on, 0 = off, -1 = not in the reply
+  char model[16] = "", sw[24] = "", api[16] = "", update_state[24] = "", last_install[24] = "";
+  char sect2[24] = "", sect3[24] = "";     // names of the open objects at depth 2 and 3
+  static void copy(char *dst, size_t n, const char *v) { strncpy(dst, v, n - 1); dst[n - 1] = 0; }
+  static void open(void *ctx, int depth, const char *key)
+  {
+    Hue_Config_Scan *c = (Hue_Config_Scan *)ctx;
+    if (depth == 2) { copy(c->sect2, sizeof(c->sect2), key); c->sect3[0] = 0; }
+    else if (depth == 3) copy(c->sect3, sizeof(c->sect3), key);
+  }
+  static void close(void *ctx, int depth)
+  {
+    Hue_Config_Scan *c = (Hue_Config_Scan *)ctx;
+    if (depth == 2) c->sect2[0] = 0;
+    else if (depth == 3) c->sect3[0] = 0;
+  }
   static void value(void *ctx, int depth, const char *key, const char *v)
   {
-    if (depth == 1 && !strcmp(key, "zigbeechannel")) ((Hue_Config_Scan *)ctx)->zigbee_channel = Hue_Sensor_Scan::atoi_(v);
+    Hue_Config_Scan *c = (Hue_Config_Scan *)ctx;
+    if (depth == 1) {
+      if (!strcmp(key, "zigbeechannel")) c->zigbee_channel = Hue_Sensor_Scan::atoi_(v);
+      else if (!strcmp(key, "modelid")) copy(c->model, sizeof(c->model), v);
+      else if (!strcmp(key, "swversion")) copy(c->sw, sizeof(c->sw), v);
+      else if (!strcmp(key, "apiversion")) copy(c->api, sizeof(c->api), v);
+    } else if (!strcmp(c->sect2, "swupdate2")) {
+      if (depth == 2 && !strcmp(key, "state")) copy(c->update_state, sizeof(c->update_state), v);
+      else if (depth == 3 && !strcmp(c->sect3, "bridge") && !strcmp(key, "lastinstall"))
+        copy(c->last_install, sizeof(c->last_install), v);
+      else if (depth == 3 && !strcmp(c->sect3, "autoinstall") && !strcmp(key, "on"))
+        c->autoinstall = !strcmp(v, "true");
+    }
   }
-  void attach(Json_Scan &j) { j.ctx = this; j.on_value = value; j.on_open = nullptr; j.on_close = nullptr; }
+  void attach(Json_Scan &j) { j.ctx = this; j.on_value = value; j.on_open = open; j.on_close = close; }
 };
 
 #ifdef ARDUINO
@@ -195,5 +224,7 @@ struct Hue_Bridge {
   uint32_t fingerprint;
   bool have_fingerprint, error_reported;
   int lights, lights_on, zigbee_channel;
+  String sw;                               // bridge firmware at the last reading since boot, "" if none yet
+  int autoinstall;                         // automatic updates at the last reading: 1 on, 0 off, -1 unknown
 };
 #endif

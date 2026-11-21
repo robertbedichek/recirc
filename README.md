@@ -46,6 +46,11 @@ Controller for a house's hot-water recirculation pump: a Waveshare
     those changes. `hue lights` lists them with names.
   - `YYYY-MM-DD HH:MM:SS hue radio 143 zigbee 25 wifi 6` at the same time: each bridge's Zigbee channel and the
     2.4 GHz channel of the access point the controller is on, to check them for overlap.
+  - `YYYY-MM-DD HH:MM:SS hue bridge 143 model BSB002 fw 1978688000 api 1.78.0 auto 1 update noupdates installed 2026-11-12T10:05:22`
+    at the same time: each bridge's model, firmware, API version, whether automatic updates are on (`auto` 1 or 0),
+    its update state and when it last installed one. Checked hourly as well: a firmware change is logged as an event
+    (`Hue bridge 143 firmware changed A -> B`), and so is automatic updates being switched; switching them on is an
+    alert, for anyone who keeps them off and updates by hand.
   - The server's 6 AM snapshot script copies the `hue` lines into `recirc_hue.txt`, kept indefinitely, for the
     battery chart on the private page.
 - **Firmware updates are pulled**, because the house LAN isn't reachable from outside.

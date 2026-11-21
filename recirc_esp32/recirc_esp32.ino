@@ -589,6 +589,9 @@ void phone_sweep(void)            // ARP every address in our /24, a few at a ti
 // motion sensors) and its Zigbee channel, and log data lines:
 //   YYYY-MM-DD HH:MM:SS hue battery 143.2 87 reachable 1 model RWL021 fw 2.45.2_hF4400CA
 //   YYYY-MM-DD HH:MM:SS hue radio 143 zigbee 25 wifi 6
+//   YYYY-MM-DD HH:MM:SS hue bridge 143 model BSB002 fw 1978688000 api 1.78.0 auto 1 update noupdates installed 2026-11-12T10:05:22
+//   (auto: the bridge's automatic updates, 1 on, 0 off, -1 unknown; a firmware change or a switch of auto since boot
+//   is logged as an event within the hour, and auto turning on is an alert)
 //   YYYY-MM-DD HH:MM:SS hue light 143.3 maker Signify_Netherlands_B.V. model LCA001 fw 1.122.2 reachable 1
 // (a bulb's line only at the first reading after boot and when its maker, model or firmware changes; spaces in
 // values become "_").
@@ -637,6 +640,8 @@ void load_bridges(void)                // From cfg.hue; presence task only
     b.key = line.substring(sp + 1);
     b.have_fingerprint = b.error_reported = false;
     b.lights = b.lights_on = b.zigbee_channel = -1;
+    b.sw = "";
+    b.autoinstall = -1;
   }
   xSemaphoreGive(hue_mutex);
 }
@@ -780,10 +785,27 @@ void hue_battery_read(bool log_lines)   // log_lines: the daily data lines; fals
     Json_Scan jc;
     Hue_Config_Scan c;
     c.attach(jc);
-    if (hue_get(b, "config", jc, &saw_error)) b.zigbee_channel = c.zigbee_channel;
+    bool have_config = hue_get(b, "config", jc, &saw_error);
+    if (have_config) b.zigbee_channel = c.zigbee_channel;
+    String octet = String(ip_octet(b.ip));
     if (log_lines)
-      out.println(timestamp() + " hue radio " + String(ip_octet(b.ip)) + " zigbee " + String(b.zigbee_channel) +
+      out.println(timestamp() + " hue radio " + octet + " zigbee " + String(b.zigbee_channel) +
                   " wifi " + String(WiFi.channel()));
+    if (have_config && c.sw[0]) {
+      if (log_lines)
+        out.println(timestamp() + " hue bridge " + octet + " model " + (c.model[0] ? c.model : "-") + " fw " + c.sw +
+                    " api " + (c.api[0] ? c.api : "-") + " auto " + String(c.autoinstall) +
+                    " update " + (c.update_state[0] ? c.update_state : "-") +
+                    " installed " + (c.last_install[0] ? c.last_install : "-"));
+      // Changes since boot, checked hourly: a new bridge firmware, or automatic updates switched on or off.
+      if (b.sw.length() && b.sw != c.sw)
+        log_event("Hue bridge " + octet + " firmware changed " + b.sw + " -> " + c.sw);
+      if (b.autoinstall >= 0 && c.autoinstall >= 0 && b.autoinstall != c.autoinstall)
+        log_event((c.autoinstall ? "alert Hue bridge " : "Hue bridge ") + octet + " automatic updates turned " +
+                  (c.autoinstall ? "on" : "off"));
+      b.sw = c.sw;
+      if (c.autoinstall >= 0) b.autoinstall = c.autoinstall;
+    }
 
     static Hue_Sensor found[HUE_MAX_SENSORS];
     Json_Scan js;
