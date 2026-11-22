@@ -392,6 +392,8 @@ int ignored_count = 0;
 int arrivals_phone = 0, arrivals_guest = 0;  // Counted in lwIP's thread (presence_mutex held), logged by the presence task
 unsigned long guest_arrival_ms = 0;   // millis() a guest device last arrived, 0 if none since boot
 volatile unsigned long occupancy_ms = 0;   // millis() of the last /occupied signal, 0 if none since boot
+#define OCC_ROOMS 16                       // /occupied?room=1..16
+unsigned long occ_room_ms[OCC_ROOMS + 1];  // millis() of each room's last signal ([0]: no room given), 0 if none
 #define BOOT_GRACE_MS (10 * 60000UL)  // Guest devices first seen this soon after boot were already there
 
 bool parse_mac(const String &s, uint8_t mac[6])
@@ -1379,6 +1381,9 @@ void handle_status(void)
   s += "  \"guest_min_ago\": " + minutes_since(last_guest_ms()) + ",\n";
   s += "  \"guest_arrival_min_ago\": " + minutes_since(last_guest_arrival_ms()) + ",\n";
   s += "  \"occupancy_min_ago\": " + minutes_since(occupancy_ms) + ",\n";
+  s += "  \"occupancy_rooms_min_ago\": [";
+  for (int r = 1; r <= OCC_ROOMS; r++) s += (r > 1 ? "," : "") + minutes_since(occ_room_ms[r]);
+  s += "],\n";
   s += "  \"guest_devices\": " + String(guests_present()) + ",\n";
   s += "  \"hue_change_min_ago\": " + minutes_since(hue_change_ms) + ",\n";
   s += "  \"hue_lights_on\": " + String(hue_lights_on) + ",\n";
@@ -1409,15 +1414,21 @@ void handle_log(void)
 }
 
 // /occupied: an occupancy signal (an Apple Home automation, from the ecobee room sensors).  No token: it can only
-// mark the house occupied for occ_hold_min.  Logged at most once every 10 minutes so a busy sensor doesn't flood the log.
+// mark the house occupied for occ_hold_min.  "/occupied?room=3" says which sensor (1-16); the private page maps the
+// numbers to room names, which stay out of recirc.txt.  Logged at most once every 10 minutes per room, so a busy
+// sensor doesn't flood the log:  # 2026-11-21 21:24:53 occupancy signal room 3
 void handle_occupied(void)
 {
-  static unsigned long logged_ms = 0;
+  static unsigned long logged_ms[OCC_ROOMS + 1];
   unsigned long now = millis();
-  occupancy_ms = now ? now : 1;
-  if (logged_ms == 0 || now - logged_ms >= 10UL * 60000UL) {
-    logged_ms = now ? now : 1;
-    log_event("occupancy signal");
+  if (now == 0) now = 1;
+  int room = server.hasArg("room") ? server.arg("room").toInt() : 0;
+  if (room < 0 || room > OCC_ROOMS) { server.send(400, "text/plain", "room is 1-16\n"); return; }
+  occupancy_ms = now;
+  occ_room_ms[room] = now;
+  if (logged_ms[room] == 0 || now - logged_ms[room] >= 10UL * 60000UL) {
+    logged_ms[room] = now;
+    log_event(room ? "occupancy signal room " + String(room) : String("occupancy signal"));
   }
   server.send(200, "text/plain", "ok\n");
 }
