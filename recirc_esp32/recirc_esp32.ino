@@ -392,8 +392,10 @@ int ignored_count = 0;
 int arrivals_phone = 0, arrivals_guest = 0;  // Counted in lwIP's thread (presence_mutex held), logged by the presence task
 unsigned long guest_arrival_ms = 0;   // millis() a guest device last arrived, 0 if none since boot
 volatile unsigned long occupancy_ms = 0;   // millis() of the last /occupied signal, 0 if none since boot
-#define OCC_ROOMS 16                       // /occupied?room=1..16
-unsigned long occ_room_ms[OCC_ROOMS + 1];  // millis() of each room's last signal ([0]: no room given), 0 if none
+#define OCC_ROOMS 16                       // Rooms learned from /<room> signals
+struct Occ_Room { char name[17]; unsigned long ms, logged_ms; };
+Occ_Room occ_rooms[OCC_ROOMS];             // Each room's last signal (millis(), 0 if none); filled in as names arrive
+int occ_room_count = 0;
 #define BOOT_GRACE_MS (10 * 60000UL)  // Guest devices first seen this soon after boot were already there
 
 bool parse_mac(const String &s, uint8_t mac[6])
@@ -1381,9 +1383,10 @@ void handle_status(void)
   s += "  \"guest_min_ago\": " + minutes_since(last_guest_ms()) + ",\n";
   s += "  \"guest_arrival_min_ago\": " + minutes_since(last_guest_arrival_ms()) + ",\n";
   s += "  \"occupancy_min_ago\": " + minutes_since(occupancy_ms) + ",\n";
-  s += "  \"occupancy_rooms_min_ago\": [";
-  for (int r = 1; r <= OCC_ROOMS; r++) s += (r > 1 ? "," : "") + minutes_since(occ_room_ms[r]);
-  s += "],\n";
+  s += "  \"occupancy_rooms_min_ago\": {";
+  for (int r = 0; r < occ_room_count; r++)
+    s += String(r ? ", " : "") + "\"" + occ_rooms[r].name + "\": " + minutes_since(occ_rooms[r].ms);
+  s += "},\n";
   s += "  \"guest_devices\": " + String(guests_present()) + ",\n";
   s += "  \"hue_change_min_ago\": " + minutes_since(hue_change_ms) + ",\n";
   s += "  \"hue_lights_on\": " + String(hue_lights_on) + ",\n";
@@ -1413,24 +1416,53 @@ void handle_log(void)
   server.send(200, "text/plain", s);
 }
 
-// /occupied: an occupancy signal (an Apple Home automation, from the ecobee room sensors).  No token: it can only
-// mark the house occupied for occ_hold_min.  "/occupied?room=3" says which sensor (1-16); the private page maps the
-// numbers to room names, which stay out of recirc.txt.  Logged at most once every 10 minutes per room, so a busy
-// sensor doesn't flood the log:  # 2026-11-21 21:24:53 occupancy signal room 3
-void handle_occupied(void)
+// Occupancy signals (an Apple Home automation, one per ecobee room sensor, opening a web address).  No token: all a
+// signal can do is mark the house occupied for occ_hold_min.
+//   /occupied      someone is somewhere
+//   /<room>        someone is in that room: /mbr, /living, /audio ... (1-16 of a-z, 0-9, "-"; up to 16 rooms, learned
+//                  as they arrive; names this server already uses are refused)
+// Logged at most once every 10 minutes per room:  # 2026-11-21 21:24:53 occupancy signal mbr
+void occupancy_signal(const String &room)
 {
-  static unsigned long logged_ms[OCC_ROOMS + 1];
   unsigned long now = millis();
   if (now == 0) now = 1;
-  int room = server.hasArg("room") ? server.arg("room").toInt() : 0;
-  if (room < 0 || room > OCC_ROOMS) { server.send(400, "text/plain", "room is 1-16\n"); return; }
   occupancy_ms = now;
-  occ_room_ms[room] = now;
-  if (logged_ms[room] == 0 || now - logged_ms[room] >= 10UL * 60000UL) {
-    logged_ms[room] = now;
-    log_event(room ? "occupancy signal room " + String(room) : String("occupancy signal"));
+  static unsigned long anon_logged_ms = 0;
+  unsigned long *logged = &anon_logged_ms;
+  if (room.length()) {
+    int r = 0;
+    while (r < occ_room_count && room != occ_rooms[r].name) r++;
+    if (r == occ_room_count) {
+      if (occ_room_count == OCC_ROOMS) { server.send(507, "text/plain", "too many rooms (16)\n"); return; }
+      memset(&occ_rooms[r], 0, sizeof(occ_rooms[r]));
+      strncpy(occ_rooms[r].name, room.c_str(), 16);
+      occ_room_count++;
+    }
+    occ_rooms[r].ms = now;
+    logged = &occ_rooms[r].logged_ms;
+  }
+  if (*logged == 0 || now - *logged >= 10UL * 60000UL) {
+    *logged = now;
+    log_event(room.length() ? "occupancy signal " + room : String("occupancy signal"));
   }
   server.send(200, "text/plain", "ok\n");
+}
+
+void handle_occupied(void) { occupancy_signal(""); }
+
+void handle_not_found(void)        // /<room>, or a real 404
+{
+  String path = server.uri();
+  String room = path.substring(1);
+  bool ok = path.startsWith("/") && room.length() >= 1 && room.length() <= 16;
+  for (unsigned i = 0; ok && i < room.length(); i++) {
+    char c = room[i];
+    ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-';
+  }
+  static const char *taken[] = { "status", "log", "cmd", "update", "occupied" };   // This server's own pages
+  for (const char *t : taken) if (room == t) ok = false;
+  if (!ok) { server.send(404, "text/plain", "not found\n"); return; }
+  occupancy_signal(room);
 }
 
 void handle_cmd(void)
@@ -1533,6 +1565,7 @@ void setup_network(void)
   server.on("/cmd", HTTP_POST, handle_cmd);
   server.on("/occupied", HTTP_GET, handle_occupied);
   server.on("/occupied", HTTP_POST, handle_occupied);
+  server.onNotFound(handle_not_found);            // /<room> occupancy signals
   server.on("/update", HTTP_POST, handle_update_done, handle_update_upload);
   server.begin();
   MDNS.begin(HOSTNAME);

@@ -28,9 +28,10 @@ Controller for a house's hot-water recirculation pump: a Waveshare
     Apple Home automation can send it through a shortcut ("Get Contents of URL") when a room sensor, such as an
     ecobee SmartSensor, detects occupancy; Apple Home runs it on a home hub (Apple TV or HomePod). It takes no
     token, since all it can do is mark the house occupied for a while, and only from the local network. Give each
-    sensor's automation its own number, `/occupied?room=3` (1-16), to see which rooms are in use: logged as
-    `# occupancy signal room 3` at most once every 10 minutes per room. Names for the numbers belong on the private
-    page, not in the log.
+    sensor's automation its own room name instead, `http://<controller>/mbr`, `/living`, `/audio` (up to 16 names of
+    1-16 lower-case letters, digits and "-", learned as they arrive; `status`, `log`, `cmd`, `update` and `occupied`
+    are taken), to see which rooms are in use: logged as `# occupancy signal mbr` at most once every 10 minutes per
+    room.
 
   With all of these off it assumes someone is home. `mode home` and `mode away` override this.
 - **Time** comes from NTP and is kept across outages by the onboard PCF85063 clock chip, which holds UTC.
