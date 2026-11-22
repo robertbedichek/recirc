@@ -16,6 +16,9 @@
 //     private (randomized) Wi-Fi address, as visitors' phones use, that had been gone for hold_min minutes or more.
 //     Arrival, not presence, because a house collects devices that never leave (an iPad, a TV); fixed gear uses
 //     real MACs and never counts.  Devices seen in the first 10 minutes after boot were already there.
+//   - an occupancy signal arrived within occ_hold_min (120) minutes: a GET or POST of /occupied, which an Apple Home
+//     automation sends (through a shortcut) when an ecobee room sensor sees someone.  It needs no token: all it can
+//     do is mark the house occupied for a while, and only from the local network.
 //   With all of these off it assumes someone is home.  "mode home|away" overrides.
 //
 // Hardware:
@@ -35,7 +38,7 @@
 // Console commands (USB serial, or POST /cmd):
 //   run | stop                      run the pump now (subject to max_run_s) | stop it
 //   mode auto|home|away             presence from phones and Hue | always home | never on schedule
-//   set interval|maxrun|rise|hold|huehold|guesthold|quiet <value>   (quiet takes "23-7"; "set" alone lists them)
+//   set interval|maxrun|rise|hold|huehold|guesthold|occhold|quiet <value>   (quiet takes "23-7"; "set" alone lists them)
 //   phone add <mac> <name> | phone del <mac> | phones
 //   guests [on|off] | guest ignore|unignore <mac>   (a private-address device that is always there, e.g. an iPad)
 //   hue pair <ip> (press the bridge's link button first; up to 4 bridges) | hue forget [ip] | hue (list bridges)
@@ -92,6 +95,7 @@ struct Settings {
                               // guest device must be gone before its return counts as an arrival
   int hue_hold_min = 120;     // ... for this long after a Hue light was switched or dimmed
   int guest_hold_min = 120;   // ... for this long after a guest device arrived
+  int occ_hold_min = 120;     // ... for this long after an occupancy signal (/occupied)
   int quiet_start_h = 23;     // No scheduled runs from quiet_start_h:00 ...
   int quiet_end_h = 7;        // ... to quiet_end_h:00, local time
   char mode = 'a';            // 'a' auto (presence), 'h' always home, 'w' away (no scheduled runs)
@@ -113,6 +117,7 @@ void save_settings(void)
   prefs.putInt("hold", cfg.hold_min);
   prefs.putInt("huehold", cfg.hue_hold_min);
   prefs.putInt("guesthold", cfg.guest_hold_min);
+  prefs.putInt("occhold", cfg.occ_hold_min);
   prefs.putInt("qstart", cfg.quiet_start_h);
   prefs.putInt("qend", cfg.quiet_end_h);
   prefs.putChar("mode", cfg.mode);
@@ -135,6 +140,7 @@ void load_settings(void)
   cfg.hold_min = prefs.getInt("hold", cfg.hold_min);
   cfg.hue_hold_min = prefs.getInt("huehold", cfg.hue_hold_min);
   cfg.guest_hold_min = prefs.getInt("guesthold", cfg.guest_hold_min);
+  cfg.occ_hold_min = prefs.getInt("occhold", cfg.occ_hold_min);
   cfg.quiet_start_h = prefs.getInt("qstart", cfg.quiet_start_h);
   cfg.quiet_end_h = prefs.getInt("qend", cfg.quiet_end_h);
   cfg.mode = prefs.getChar("mode", cfg.mode);
@@ -385,6 +391,7 @@ uint8_t ignored[16][6];
 int ignored_count = 0;
 int arrivals_phone = 0, arrivals_guest = 0;  // Counted in lwIP's thread (presence_mutex held), logged by the presence task
 unsigned long guest_arrival_ms = 0;   // millis() a guest device last arrived, 0 if none since boot
+volatile unsigned long occupancy_ms = 0;   // millis() of the last /occupied signal, 0 if none since boot
 #define BOOT_GRACE_MS (10 * 60000UL)  // Guest devices first seen this soon after boot were already there
 
 bool parse_mac(const String &s, uint8_t mac[6])
@@ -497,7 +504,7 @@ bool someone_home(void)
   bool have_phones = phone_count > 0, have_hue = cfg.hue.length() > 0;
   if (!have_phones && !have_hue && !cfg.guests) return true;   // Nothing to go on: assume yes
   return recent(last_phone_ms(), cfg.hold_min) || recent(hue_change_ms, cfg.hue_hold_min) ||
-         (cfg.guests && recent(last_guest_arrival_ms(), cfg.guest_hold_min));
+         (cfg.guests && recent(last_guest_arrival_ms(), cfg.guest_hold_min)) || recent(occupancy_ms, cfg.occ_hold_min);
 }
 
 // lwIP's raw ARP calls must run in its own thread
@@ -1180,7 +1187,8 @@ void status_line(void)
               " arrive " + minutes_since(last_guest_arrival_ms()) +
               " devices " + String(guests_present()) + " hue " + minutes_since(hue_change_ms) +
               " lights " + String(hue_lights_on) + "/" + String(hue_lights) +
-              " runs " + String(runs_today) + " secs " + String(run_seconds_today) + " rssi " + String(WiFi.RSSI()));
+              " runs " + String(runs_today) + " secs " + String(run_seconds_today) + " rssi " + String(WiFi.RSSI()) +
+              " occ " + minutes_since(occupancy_ms));
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1188,10 +1196,10 @@ void status_line(void)
 
 String settings_text(void)
 {
-  char b[260];
+  char b[300];
   snprintf(b, sizeof(b), "interval %d min, maxrun %d s, rise %.1f F, hold %d min, huehold %d min, guesthold %d min, "
-           "quiet %d-%d, mode %s, guests %s, upload %s",
-           cfg.interval_min, cfg.max_run_s, cfg.rise_F, cfg.hold_min, cfg.hue_hold_min, cfg.guest_hold_min,
+           "occhold %d min, quiet %d-%d, mode %s, guests %s, upload %s",
+           cfg.interval_min, cfg.max_run_s, cfg.rise_F, cfg.hold_min, cfg.hue_hold_min, cfg.guest_hold_min, cfg.occ_hold_min,
            cfg.quiet_start_h, cfg.quiet_end_h,
            cfg.mode == 'h' ? "home" : cfg.mode == 'w' ? "away" : "auto", cfg.guests ? "on" : "off", cfg.upload ? "on" : "off");
   return String(b);
@@ -1227,11 +1235,12 @@ String run_command(String c)
     else if (what == "hold" && v.toInt() >= 5 && v.toInt() <= 24 * 60) cfg.hold_min = v.toInt();
     else if (what == "huehold" && v.toInt() >= 5 && v.toInt() <= 24 * 60) cfg.hue_hold_min = v.toInt();
     else if (what == "guesthold" && v.toInt() >= 5 && v.toInt() <= 24 * 60) cfg.guest_hold_min = v.toInt();
+    else if (what == "occhold" && v.toInt() >= 5 && v.toInt() <= 24 * 60) cfg.occ_hold_min = v.toInt();
     else if (what == "quiet" && v.indexOf('-') > 0) {
       int a = v.substring(0, v.indexOf('-')).toInt(), b = v.substring(v.indexOf('-') + 1).toInt();
       if (a < 0 || a > 23 || b < 0 || b > 23) return "quiet takes hours 0-23, like 23-7";
       cfg.quiet_start_h = a; cfg.quiet_end_h = b;
-    } else return "set interval 5-240 | maxrun 10-600 | rise 1-30 | hold|huehold|guesthold 5-1440 | quiet H-H";
+    } else return "set interval 5-240 | maxrun 10-600 | rise 1-30 | hold|huehold|guesthold|occhold 5-1440 | quiet H-H";
     save_settings();
     log_event("set " + rest);
     return settings_text();
@@ -1369,6 +1378,7 @@ void handle_status(void)
   s += "  \"phone_min_ago\": " + minutes_since(last_phone_ms()) + ",\n";
   s += "  \"guest_min_ago\": " + minutes_since(last_guest_ms()) + ",\n";
   s += "  \"guest_arrival_min_ago\": " + minutes_since(last_guest_arrival_ms()) + ",\n";
+  s += "  \"occupancy_min_ago\": " + minutes_since(occupancy_ms) + ",\n";
   s += "  \"guest_devices\": " + String(guests_present()) + ",\n";
   s += "  \"hue_change_min_ago\": " + minutes_since(hue_change_ms) + ",\n";
   s += "  \"hue_lights_on\": " + String(hue_lights_on) + ",\n";
@@ -1396,6 +1406,20 @@ void handle_log(void)
   recent_lines.copy_tail(s, server.hasArg("bytes") ? server.arg("bytes").toInt() : 8192);
   xSemaphoreGive(lines_mutex);
   server.send(200, "text/plain", s);
+}
+
+// /occupied: an occupancy signal (an Apple Home automation, from the ecobee room sensors).  No token: it can only
+// mark the house occupied for occ_hold_min.  Logged at most once every 10 minutes so a busy sensor doesn't flood the log.
+void handle_occupied(void)
+{
+  static unsigned long logged_ms = 0;
+  unsigned long now = millis();
+  occupancy_ms = now ? now : 1;
+  if (logged_ms == 0 || now - logged_ms >= 10UL * 60000UL) {
+    logged_ms = now ? now : 1;
+    log_event("occupancy signal");
+  }
+  server.send(200, "text/plain", "ok\n");
 }
 
 void handle_cmd(void)
@@ -1496,6 +1520,8 @@ void setup_network(void)
   server.on("/status", HTTP_GET, handle_status);
   server.on("/log", HTTP_GET, handle_log);
   server.on("/cmd", HTTP_POST, handle_cmd);
+  server.on("/occupied", HTTP_GET, handle_occupied);
+  server.on("/occupied", HTTP_POST, handle_occupied);
   server.on("/update", HTTP_POST, handle_update_done, handle_update_upload);
   server.begin();
   MDNS.begin(HOSTNAME);

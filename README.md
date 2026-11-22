@@ -24,6 +24,11 @@ Controller for a house's hot-water recirculation pump: a Waveshare
     collects private-address devices that never leave; devices seen in the first 10 minutes after boot were
     already there. `guests off` turns it off; `guest ignore <mac>` drops a device entirely. `guests` lists what
     it has seen.
+  - **An occupancy signal** within `occhold` minutes (120): any GET or POST of `http://<controller>/occupied`. An
+    Apple Home automation can send it through a shortcut ("Get Contents of URL") when a room sensor, such as an
+    ecobee SmartSensor, detects occupancy; Apple Home runs it on a home hub (Apple TV or HomePod). It takes no
+    token, since all it can do is mark the house occupied for a while, and only from the local network. Logged as
+    `# occupancy signal` at most once every 10 minutes.
 
   With all of these off it assumes someone is home. `mode home` and `mode away` override this.
 - **Time** comes from NTP and is kept across outages by the onboard PCF85063 clock chip, which holds UTC.
@@ -31,8 +36,8 @@ Controller for a house's hot-water recirculation pump: a Waveshare
 - **Telemetry** is posted to `https://bedichek.org/home/api/ingest/recirc`, appending to
   `recirc.txt` in a private, unlisted folder on the server (its path is set in the ingest service, not here). Lines containing "alert" go to Pushover, as for the solar controllers.
   - `YYYY-MM-DD HH:MM:SS run schedule warm secs 34 start 61.2 end 65.4 peak 65.6`
-  - `YYYY-MM-DD HH:MM:SS status T 64.2 home 1 phone 12 guest 3 arrive 40 devices 2 hue 45 lights 3/41 runs 14 secs 410 rssi -62`,
-    every 5 minutes. `phone`, `guest` and `hue` are minutes since last seen, `arrive` minutes since a guest device
+  - `YYYY-MM-DD HH:MM:SS status T 64.2 home 1 phone 12 guest 3 arrive 40 devices 2 hue 45 lights 3/41 runs 14 secs 410 rssi -62 occ 8`,
+    every 5 minutes (`occ`: minutes since an occupancy signal). `phone`, `guest` and `hue` are minutes since last seen, `arrive` minutes since a guest device
     arrived, -1 meaning never; `devices` is how many guest devices were seen within the hold time.
   - `YYYY-MM-DD HH:MM:SS arrive guest 1 present 2` when a family phone or guest device shows up after being away
     longer than the hold time. These lines carry no MAC addresses or names.
