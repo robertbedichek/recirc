@@ -37,7 +37,8 @@ Controller for a house's hot-water recirculation pump: a Waveshare
   - `YYYY-MM-DD HH:MM:SS arrive guest 1 present 2` when a family phone or guest device shows up after being away
     longer than the hold time. These lines carry no MAC addresses or names.
   - `YYYY-MM-DD HH:MM:SS hue battery 143.2 87 reachable 1 model RWL022 fw 2.45.2_hF4400CA`, once after boot and then daily at 09:00,
-    for every battery-powered Hue accessory (dimmers, buttons, tap dials, motion sensors). `143.2` is the
+    for every battery-powered Hue accessory (dimmers, buttons, tap dials, motion sensors), and at the hourly check for
+    any whose % moved 20 points or more since the last reading (so a new cell shows within the hour). `143.2` is the
     bridge's last address byte and the bridge's id for the accessory; `hue batteries` shows the names, which
     stay out of recirc.txt. A v2 dimmer's % runs from about 3.0 V (0%) to 3.25 V (100%), and it quits a little under 3 V.
     It also checks every hour, without logging, and alerts when an accessory that was reachable stops responding.

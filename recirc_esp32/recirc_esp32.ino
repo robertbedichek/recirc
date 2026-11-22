@@ -599,7 +599,8 @@ void phone_sweep(void)            // ARP every address in our /24, a few at a ti
 // values become "_").
 // 143.2 is the bridge's last address byte and the accessory's id on it; "hue batteries" shows their names, which stay
 // out of recirc.txt because it is public.  wifi is the 2.4 GHz channel of the access point this board is on.
-// Every hour it also checks them without logging, and alerts when one that was reachable becomes unreachable: the
+// Every hour it also checks them, logging a battery line only for one whose % moved 20 points or more since the last
+// reading (a new cell shows up within the hour), and alerts when one that was reachable becomes unreachable: the
 // switch has stopped working (usually a cell sagging under load).  A v2 dimmer's % runs from about 3.0 V (0%) to
 // 3.25 V (100%): Rob's office dimmer read 1% at 3.05 V and 100% on a fresh cell (2026-11-18).
 
@@ -819,12 +820,18 @@ void hue_battery_read(bool log_lines)   // log_lines: the daily data lines; fals
       h.s = found[k];
       h.bridge_octet = ip_octet(b.ip);
       int was = -1;                                       // Reachable at the last reading since boot, -1 if unknown
+      int was_pct = -1;                                   // Battery % at the last reading since boot, -1 if unknown
       xSemaphoreTake(hue_mutex, portMAX_DELAY);
       for (int m = 0; m < hue_batt_count; m++)
-        if (hue_batts[m].bridge_octet == h.bridge_octet && !strcmp(hue_batts[m].s.id, h.s.id)) was = hue_batts[m].s.reachable;
+        if (hue_batts[m].bridge_octet == h.bridge_octet && !strcmp(hue_batts[m].s.id, h.s.id)) {
+          was = hue_batts[m].s.reachable;
+          was_pct = hue_batts[m].s.battery;
+        }
       xSemaphoreGive(hue_mutex);
       String tag = String(h.bridge_octet) + "." + h.s.id;
-      if (log_lines)
+      // Between the daily readings, a jump of 20 points or more (usually a new cell) is logged at the hourly check.
+      bool jumped = was_pct >= 0 && abs(h.s.battery - was_pct) >= 20;
+      if (log_lines || jumped)
         out.println(timestamp() + " hue battery " + tag + " " + String(h.s.battery) + " reachable " + String(h.s.reachable) +
                     " model " + (h.s.model[0] ? h.s.model : "-") + " fw " + (h.s.fw[0] ? h.s.fw : "-"));
       // Only a change seen since boot alerts, so reboots don't repeat alerts for accessories long gone.
