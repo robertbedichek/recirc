@@ -103,6 +103,7 @@ struct Settings {
   String phones;              // "aa:bb:cc:dd:ee:ff=name;..." lower case
   bool guests = true;         // Any device with a private (randomized) Wi-Fi address counts too: guests' phones
   String ignore;              // "aa:bb:cc:dd:ee:ff;..." private-address devices that never mean someone is home
+  bool watch = true;          // Alert on signs of someone at the house while no family phone is on the network
   String hue;                 // "ip key\n" per paired Hue bridge (key from "hue pair")
 } cfg;
 
@@ -125,6 +126,7 @@ void save_settings(void)
   prefs.putString("phones", cfg.phones);
   prefs.putBool("guests", cfg.guests);
   prefs.putString("ignore", cfg.ignore);
+  prefs.putBool("watch", cfg.watch);
   prefs.putString("hue", cfg.hue);
   if (prefs.isKey("hue_ip")) prefs.remove("hue_ip");          // Replaced by "hue"
   if (prefs.isKey("hue_user")) prefs.remove("hue_user");
@@ -148,6 +150,7 @@ void load_settings(void)
   cfg.phones = prefs.getString("phones", "");
   cfg.guests = prefs.getBool("guests", cfg.guests);
   cfg.ignore = prefs.getString("ignore", "");
+  cfg.watch = prefs.getBool("watch", cfg.watch);
   cfg.hue = prefs.getString("hue", "");
   if (cfg.hue.length() == 0 && prefs.getString("hue_user", "").length())     // One bridge, from before 2026-11-17
     cfg.hue = prefs.getString("hue_ip", "") + " " + prefs.getString("hue_user", "") + "\n";
@@ -396,6 +399,7 @@ volatile unsigned long occupancy_ms = 0;   // millis() of the last /occupied sig
 struct Occ_Room { char name[17]; unsigned long ms, logged_ms; };
 Occ_Room occ_rooms[OCC_ROOMS];             // Each room's last signal (millis(), 0 if none); filled in as names arrive
 int occ_room_count = 0;
+char occ_last_room[17];                    // Room of the last signal, "" for /occupied (for the watch alert)
 #define BOOT_GRACE_MS (10 * 60000UL)  // Guest devices first seen this soon after boot were already there
 
 bool parse_mac(const String &s, uint8_t mac[6])
@@ -509,6 +513,48 @@ bool someone_home(void)
   if (!have_phones && !have_hue && !cfg.guests) return true;   // Nothing to go on: assume yes
   return recent(last_phone_ms(), cfg.hold_min) || recent(hue_change_ms, cfg.hue_hold_min) ||
          (cfg.guests && recent(last_guest_arrival_ms(), cfg.guest_hold_min)) || recent(occupancy_ms, cfg.occ_hold_min);
+}
+
+// Watch: a sign of someone at the house (an ecobee room signal, a Hue light switched or dimmed, a guest device
+// arriving) while neither family phone has been seen for hold_min.  Arriving, the house often notices you a minute
+// before the phones rejoin Wi-Fi, so it waits WATCH_WAIT_MS for one to turn up.  Then one alert (Pushover, like every
+// "alert" line), and no more until a family phone is seen or there have been no signs for WATCH_QUIET_MS.
+#define WATCH_WAIT_MS (10 * 60000UL)
+#define WATCH_QUIET_MS (120 * 60000UL)
+
+String minutes_since(unsigned long ms);
+
+void watch_check(void)            // From the presence task, every second
+{
+  static unsigned long seen_occ = 0, seen_hue = 0, seen_guest = 0;   // Signs already taken in
+  static unsigned long first_ms = 0, last_ms = 0;                    // First sign of the pending alert; latest sign
+  static bool alerted = false;
+  static String what;
+  unsigned long now = millis(), occ = occupancy_ms, hue = hue_change_ms, guest = last_guest_arrival_ms();
+  String sign;
+  if (occ != seen_occ) {
+    seen_occ = occ;
+    char room[17];
+    memcpy(room, occ_last_room, sizeof(room));
+    room[16] = 0;
+    sign = room[0] ? String("ecobee ") + room : String("an occupancy signal");
+  }
+  if (hue != seen_hue) { seen_hue = hue; if (!sign.length()) sign = "a Hue light switched"; }
+  if (guest != seen_guest) { seen_guest = guest; if (!sign.length()) sign = "a guest device arrived"; }
+  if (sign.length()) last_ms = now;
+  if (!cfg.watch || phone_count == 0 || recent(last_phone_ms(), cfg.hold_min)) { first_ms = 0; alerted = false; return; }
+  if (alerted && now - last_ms > WATCH_QUIET_MS) alerted = false;
+  if (sign.length() && !alerted) {
+    if (first_ms == 0) { first_ms = now; what = sign; }
+    else if (what.indexOf(sign) < 0 && what.length() < 100) what += ", " + sign;
+  }
+  if (first_ms && now - first_ms >= WATCH_WAIT_MS) {
+    String gone = minutes_since(last_phone_ms());
+    log_event("alert someone is at the house but neither family phone is on the network (" +
+              (gone == "-1" ? String("none seen since boot") : "last seen " + gone + " min ago") + "): " + what);
+    first_ms = 0;
+    alerted = true;
+  }
 }
 
 // lwIP's raw ARP calls must run in its own thread
@@ -1031,6 +1077,7 @@ void presence_task(void *arg)
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(1000));
     if (hue_reload) { hue_reload = false; load_bridges(); last_hue = 0; }
+    watch_check();
     if (millis() - last_hue > 60000 || last_hue == 0) { last_hue = millis(); hue_poll(); }
     if (bridge_count && time_valid && millis() > 180000) {   // Batteries: 3 min after boot or pairing, then 09:00 daily
       time_t t = time(nullptr);
@@ -1202,10 +1249,11 @@ String settings_text(void)
 {
   char b[300];
   snprintf(b, sizeof(b), "interval %d min, maxrun %d s, rise %.1f F, hold %d min, huehold %d min, guesthold %d min, "
-           "occhold %d min, quiet %d-%d, mode %s, guests %s, upload %s",
+           "occhold %d min, quiet %d-%d, mode %s, guests %s, watch %s, upload %s",
            cfg.interval_min, cfg.max_run_s, cfg.rise_F, cfg.hold_min, cfg.hue_hold_min, cfg.guest_hold_min, cfg.occ_hold_min,
            cfg.quiet_start_h, cfg.quiet_end_h,
-           cfg.mode == 'h' ? "home" : cfg.mode == 'w' ? "away" : "auto", cfg.guests ? "on" : "off", cfg.upload ? "on" : "off");
+           cfg.mode == 'h' ? "home" : cfg.mode == 'w' ? "away" : "auto", cfg.guests ? "on" : "off", cfg.watch ? "on" : "off",
+           cfg.upload ? "on" : "off");
   return String(b);
 }
 
@@ -1284,6 +1332,10 @@ String run_command(String c)
     }
     xSemaphoreGive(presence_mutex);
     return r.length() ? r : String("no phones listed");
+  }
+  if (verb == "watch") {
+    if (rest == "on" || rest == "off") { cfg.watch = rest == "on"; save_settings(); log_event("watch " + rest); }
+    return String("watch ") + (cfg.watch ? "on" : "off") + ": alert on signs of someone while no family phone is on the network";
   }
   if (verb == "guests" || verb == "guest") {
     if (rest == "on" || rest == "off") { cfg.guests = rest == "on"; save_settings(); log_event("guests " + rest); }
@@ -1426,6 +1478,8 @@ void occupancy_signal(const String &room)
 {
   unsigned long now = millis();
   if (now == 0) now = 1;
+  strncpy(occ_last_room, room.c_str(), 16);
+  occ_last_room[16] = 0;
   occupancy_ms = now;
   static unsigned long anon_logged_ms = 0;
   unsigned long *logged = &anon_logged_ms;

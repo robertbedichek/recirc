@@ -34,6 +34,12 @@ Controller for a house's hot-water recirculation pump: a Waveshare
     room.
 
   With all of these off it assumes someone is home. `mode home` and `mode away` override this.
+- **Watch alert**: a sign of someone at the house (an occupancy signal, a Hue light switched, a guest device
+  arriving) while no family phone has been seen for `hold` minutes logs one
+  `alert someone is at the house but neither family phone is on the network (last seen 988 min ago): ecobee living`,
+  which goes to Pushover. It waits 10 minutes first, since arriving home the house often notices you a minute before
+  the phones rejoin Wi-Fi, and stays quiet afterwards until a family phone is seen or there have been no signs for
+  2 hours. `watch off` turns it off.
 - **Time** comes from NTP and is kept across outages by the onboard PCF85063 clock chip, which holds UTC.
   The schedule uses Pacific time.
 - **Telemetry** is posted to `https://bedichek.org/home/api/ingest/recirc`, appending to
@@ -111,5 +117,5 @@ the PCF85063 clock chip on I2C SDA 39, SCL 38 (address 0x51), RS485 on 17/18/21 
 
 `run`, `stop`, `mode auto|home|away`, `set interval|maxrun|rise|hold|huehold|guesthold|quiet <v>`, `phone add|del`, `phones`,
 `guests [on|off]`, `guest ignore|unignore <mac>`,
-`hue` (list bridges), `hue pair <ip>`, `hue forget [ip]`, `hue batteries`, `hue lights`, `hue rooms` (rooms and zones with their bulbs, and the rooms each switch acts on, from the bridges' rules), `hue delete-light <bridge>.<id>` (only an unreachable bulb), `hue delete-sensor <bridge>.<id>` (only an unreachable switch or sensor), `upload on|off`, `update check`, `reboot`. Send them over USB serial, or with
+`hue` (list bridges), `hue pair <ip>`, `hue forget [ip]`, `hue batteries`, `hue lights`, `hue rooms` (rooms and zones with their bulbs, and the rooms each switch acts on, from the bridges' rules), `hue delete-light <bridge>.<id>` (only an unreachable bulb), `hue delete-sensor <bridge>.<id>` (only an unreachable switch or sensor), `watch on|off`, `upload on|off`, `update check`, `reboot`. Send them over USB serial, or with
 `./rcctl cmd ...` on the LAN.
